@@ -1,0 +1,17 @@
+[Unit]
+Description=Amazon Lead Filter Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=leadbot
+# IMPORTANT: set this to the directory containing main.py and .env
+WorkingDirectory=/home/leadbot/app
+Environment=PYTHONUNBUFFERED=1
+# Update the path below to your venv's python
+ExecStart=/home/leadbot/app/.venv/bin/python /home/leadbot/app/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
