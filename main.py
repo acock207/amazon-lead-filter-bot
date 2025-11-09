@@ -1,4 +1,4 @@
-    # main.py — Amazon Lead Filter Bot (Discord.py 2.x)
+# main.py — Amazon Lead Filter Bot (Discord.py 2.x)
 # -------------------------------------------------
 # What this version adds:
 # - Persistent watch list (config.json): /watch_add, /watch_remove, /watch_list, /watch_add_all, /watch_all, /watch_clear
@@ -97,6 +97,32 @@ ROI_RE = re.compile(r"\bROI[:\s]([0-9]+(?:\.[0-9]+)?)\s%?", re.I)
 ELIG_RE = re.compile(r"\bEligibl\w*[:\s-]*([Yy]es|[Nn]o|Unknown)\b")
 MONEY_RE = re.compile(r"£\s*([0-9]+(?:\.[0-9]{1,2})?)")
 
+# Common words that might accidentally match ASIN regex (10 chars, alphanumeric)
+INVALID_ASIN_WORDS = {
+    "ATTACHMENT", "DOWNLOAD", "REGISTER", "SUBSCRIPT", "VALIDATIO", 
+    "AUTHORIZE", "DOCUMENT", "TEMPORARY", "PERMANENT", "AVAILABLE",
+    "UNAVAILAB", "PURCHASED", "COMPLETED", "CANCELLED", "RECEIVED",
+    "DELIVERED", "SHIPPING", "PROCESSED", "ACTIVATED", "DISABLED"
+}
+
+def is_valid_asin(asin: str) -> bool:
+    """Validate that a string is a real ASIN, not a common word."""
+    if not asin or len(asin) != 10:
+        return False
+    asin_upper = asin.upper()
+    # Reject common words
+    if asin_upper in INVALID_ASIN_WORDS:
+        return False
+    # Real ASINs typically start with B (new) or 0-9 (old), not common letter combinations
+    # They also usually have a mix of letters and numbers, not all letters
+    if asin_upper.isalpha() and not any(c.isdigit() for c in asin_upper):
+        # If it's all letters and doesn't start with B, be suspicious
+        if not asin_upper.startswith('B'):
+            # Check if it looks like a common English word pattern
+            if len(set(asin_upper)) < 6:  # Too few unique letters suggests a word
+                return False
+    return True
+
 def money(n: Optional[float]) -> str:
     return "—" if n is None else f"£{n:.2f}"
 
@@ -182,8 +208,26 @@ async def try_dm(user_id: int, content: str = "", embed: Optional[discord.Embed]
 
 def extract_from_text(txt: str):
     asin = None; buy=None; sell=None; roi=None; elig=None
-    m = ASIN_RE.search(txt)
-    if m: asin = m.group(1).upper()
+    # Try to find ASIN - look for all matches and validate them
+    asin_matches = ASIN_RE.findall(txt)
+    log.debug(f"Found {len(asin_matches)} potential ASIN matches: {asin_matches}")
+    for match in asin_matches:
+        candidate = match.upper()
+        if is_valid_asin(candidate):
+            asin = candidate
+            log.info(f"✓ Valid ASIN found: {asin}")
+            break
+        else:
+            log.debug(f"✗ Rejected invalid ASIN candidate: {candidate}")
+    
+    # Also check for ASIN in Amazon URLs (more reliable)
+    amazon_url_pattern = r"amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx|com\.br|com\.au|nl)/.*?/(?:dp|gp/product|product)/([A-Z0-9]{10})"
+    url_match = re.search(amazon_url_pattern, txt, re.I)
+    if url_match:
+        url_asin = url_match.group(1).upper()
+        if is_valid_asin(url_asin):
+            asin = url_asin
+            log.info(f"✓ Found ASIN from Amazon URL: {asin}")
 
     mb = re.search(r"\b(Buy|Cost|Price)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
     if mb: buy = float(mb.group(2))
@@ -323,20 +367,22 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
             while isinstance(js, list) and js:
                 js = js[0]
             if not isinstance(js, dict):
-                return None, None, None, f"Unexpected JSON type {type(js)._name_} domain={domain}", None
+                return None, None, None, f"Unexpected JSON type {type(js).__name__} domain={domain}", None
 
             products = js.get("products")
+            if products is None:
+                return None, None, None, f"No 'products' key in response domain={domain}", None
             if isinstance(products, list):
                 if not products:
-                    return None, None, None, f"No products domain={domain}", None
+                    return None, None, None, f"Empty products list domain={domain}", None
                 p = products[0]
             elif isinstance(products, dict):
                 p = products
             else:
-                return None, None, None, f"Invalid 'products' type={type(products)._name_} domain={domain}", None
+                return None, None, None, f"Invalid 'products' type={type(products).__name__} domain={domain}", None
 
             if not isinstance(p, dict):
-                return None, None, None, f"Bad product data type={type(p)._name_} domain={domain}", None
+                return None, None, None, f"Bad product data type={type(p).__name__} domain={domain}", None
 
             stats = p.get("stats") or {}
             if isinstance(stats, list): stats = {}
@@ -449,26 +495,54 @@ async def handle_lead_message(message: discord.Message):
             ip_pl = ip_pl or ip_pl2
 
     if not asin:
-        log.info(f"No ASIN found, skipping message from #{message.channel.name}")
+        log.debug(f"No valid ASIN found in message from #{message.channel.name}, skipping")
+        return
+    
+    # Double-check ASIN is valid before processing
+    if not is_valid_asin(asin):
+        log.warning(f"Invalid ASIN detected: {asin} - skipping message from #{message.channel.name}")
         return
     
     log.info(f"✓ Found ASIN: {asin} in #{message.channel.name}")
     log.info(f"  Initial data - Buy: {buy} | Sell: {sell} | ROI: {roi} | Elig: {elig}")
 
+    # Always fetch Keepa data for ASIN (for Sell price, Brand, Title)
+    # NOTE: Keepa only provides SELL prices, not BUY prices
     keepa_diag = ""
     domain_used: Optional[int] = None
+    keepa_brand = None
+    keepa_title = None
+    keepa_sell = None
+    
+    log.info(f"  Fetching Keepa data for {asin}...")
+    async with aiohttp.ClientSession() as session:
+        ks, brand, title, keepa_diag, domain_used = await keepa_fetch(session, asin)
+        keepa_sell = ks
+        if brand:
+            keepa_brand = brand
+        if title:
+            keepa_title = title
+        log.info(f"  Keepa result - Sell: {keepa_sell} | Brand: {keepa_brand} | Title: {keepa_title[:50] if keepa_title else None} | Domain: {domain_used}")
+    
+    # Use Keepa sell price if we don't have one from message
     if sell is None or sell <= 0:
-        log.info(f"  Fetching Keepa data for {asin}...")
-        async with aiohttp.ClientSession() as session:
-            ks, brand, title, keepa_diag, domain_used = await keepa_fetch(session, asin)
-            if sell is None:
-                sell = ks  # only fill if we had nothing
-            log.info(f"  Keepa result - Sell: {sell} | Brand: {brand} | Domain: {domain_used}")
+        if keepa_sell:
+            sell = keepa_sell
+            log.info(f"  Using Sell price from Keepa: {sell}")
+        else:
+            log.warning(f"  No Sell price found in message OR Keepa")
+    else:
+        log.info(f"  Using Sell price from message: {sell} (Keepa had: {keepa_sell})")
 
-    if buy is None and DEFAULT_BUY > 0:
-        buy = DEFAULT_BUY
-        log.info(f"  Using DEFAULT_BUY: {buy}")
+    # Use DEFAULT_BUY if no Buy price in message
+    if buy is None:
+        if DEFAULT_BUY > 0:
+            buy = DEFAULT_BUY
+            log.info(f"  Using DEFAULT_BUY from .env: {buy}")
+        else:
+            log.warning(f"  No Buy price found in message AND DEFAULT_BUY is not set - ROI cannot be calculated")
 
+    # Calculate profit and ROI from Buy + Sell
     profit, roi_calc = compute_profit_roi(buy, sell)
     if roi is None:
         roi = roi_calc
@@ -483,24 +557,46 @@ async def handle_lead_message(message: discord.Message):
     amz_url = amazon_url_for_domain(asin, amz_domain)
     sas_url = f"https://sas.selleramp.com/sas/lookup?asin={asin}&sas_cost_price={(buy or 0):.2f}&source_url={amz_url.replace(':','%3A').replace('/','%2F')}"
 
+    # Build embed title with product info if available
+    embed_title = keepa_title[:100] + "..." if keepa_title and len(keepa_title) > 100 else (keepa_title or f"ASIN: {asin}")
+    
     embed = discord.Embed(
         title=("✅ Approved Lead" if ok else "❌ Not Approved"),
-        description=f"ASIN: *{asin}*",
+        description=f"**ASIN:** `{asin}`" + (f"\n**Brand:** {keepa_brand}" if keepa_brand else ""),
         color=0x18a558 if ok else 0xC23B22
     )
+    
+    # Add product title if we have it from Keepa
+    if keepa_title:
+        embed.add_field(name="Product", value=keepa_title[:200] + "..." if len(keepa_title) > 200 else keepa_title, inline=False)
+    
     embed.add_field(name="Buy", value=money(buy), inline=True)
     embed.add_field(name="Sell", value=money(sell), inline=True)
     embed.add_field(name="Profit", value=money(profit), inline=True)
 
     # ROI field shows percent + (Sell, Buy)
     roi_str = pct(roi)
-    roi_str += f"  (Sell {money(sell)}, Buy {money(buy)})"
+    if buy and sell:
+        roi_str += f"  (Sell {money(sell)}, Buy {money(buy)})"
+    elif not buy:
+        roi_str += "  (Buy price missing)"
+    elif not sell:
+        roi_str += "  (Sell price missing)"
     embed.add_field(name="ROI", value=roi_str, inline=False)
 
     embed.add_field(name="Eligibility", value=(elig or "Unknown"), inline=True)
     embed.add_field(name="Links", value=f"[Amazon]({amz_url}) • [SAS]({sas_url})", inline=False)
+    
+    # Footer with data sources
+    footer_parts = []
     if keepa_diag:
-        embed.set_footer(text=f"Keepa: {keepa_diag}")
+        footer_parts.append(f"Keepa: {keepa_diag}")
+    if buy and DEFAULT_BUY > 0 and buy == DEFAULT_BUY:
+        footer_parts.append("Buy from DEFAULT_BUY")
+    if sell and keepa_sell and sell == keepa_sell:
+        footer_parts.append("Sell from Keepa")
+    if footer_parts:
+        embed.set_footer(text=" • ".join(footer_parts))
 
     await message.reply(embed=embed, mention_author=False)
     await try_dm(FORWARD_USER_ID, f"Lead from #{message.channel.name}", embed)
