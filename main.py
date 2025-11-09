@@ -1,634 +1,714 @@
-
-# main.py — Amazon Lead Filter Bot (Final Pro + OCR)
+    # main.py — Amazon Lead Filter Bot (Discord.py 2.x)
+# -------------------------------------------------
+# What this version adds:
+# - Persistent watch list (config.json): /watch_add, /watch_remove, /watch_list, /watch_add_all, /watch_all, /watch_clear
+# - Parses ANY lead by first rewriting message+embeds to plain text; OCR fallback for images (optional)
+# - Robust Keepa fetch (handles dict/list shapes, stats.current.*, CSV fallbacks, multi-domain tries)
+# - ROI field shows % PLUS (Sell £X, Buy £Y); ASIN is shown clearly
+# - Your rules: Eligibility=Yes (unless allowed), Profit ≥ £5, ROI ≥ 8%, and reject if IP/PL
+# - Tools: /settings /set_min_profit /set_min_roi /set_default_buy /set_allow_unknown_elig /diag_asin /calc_asin
+# - Context menu: “Show Plain Text” (right-click a message → Apps)
 #
-# Features
-#   • Filters Discord lead posts and DMs you ONLY when they pass:
-#       - Eligibility: Yes (or missing if toggle enabled)
-#       - ROI >= MIN_ROI (explicit ROI or approximate from Buy/Sell or Was/Now)
-#       - No IP/PL/IP Alert
-#   • ASIN extraction from:
-#       - Amazon URLs in content, embed text, or title link
-#       - Plain tokens like B0XXXXXXXX
-#   • SAS links prefilled with Buy/Sell (or Was/Now) values
-#   • Cross-server relay mapping: /link_channels, /link_clear
-#   • Per-guild settings with persistence (config.json):
-#       - /set_min_roi, /toggle_dm, /toggle_allow_missing_eligibility
-#       - /set_dedupe_hours, /set_log_channel
-#   • Diagnostics & status: /diag_last, /status
-#   • Optional OCR for image-only posts (screenshots):
-#       - Set OCR_PROVIDER=ocrspace (needs OCRSPACE_API_KEY) or OCR_PROVIDER=pytesseract
-#   • Utility: /asin_links <asin> [tag] — build product links for multiple marketplaces
-#
-# Quick start
+# Setup:
 #   pip install -U discord.py python-dotenv aiohttp
-#   # (optional OCR) pip install pillow pytesseract  (and install Tesseract from your OS)
+#   Create .env (same folder):
+#       DISCORD_TOKEN=YOUR_BOT_TOKEN
+#       FORWARD_USER_ID=YOUR_USER_ID
+#       KEEPA_KEY=YOUR_KEEPA_KEY
+#       KEEPA_DOMAIN=GB            # accepts GB/UK/US/DE or number; bot tries UK→DE→US fallback
+#       MIN_PROFIT=5
+#       MIN_ROI=8
+#       ALLOW_UNKNOWN_ELIG=false
+#       DEFAULT_BUY=10
+#       OCRSPACE_KEY=YOUR_OCR_SPACE_API_KEY   # optional; leave blank to disable OCR
 #
-#   .env:
-#       DISCORD_TOKEN=...
-#       FORWARD_USER_ID=123456789012345678
-#       MIN_ROI=20
-#       WATCH_CHANNEL_IDS=
-#       BLOCK_ALERT_KEYWORDS=IP,PL
-#       FALLBACK_TO_CHANNEL_ON_DM_FAIL=true
-#       OCR_PROVIDER=ocrspace
-#       OCRSPACE_API_KEY=YOUR_KEY
-#       OCR_LANG=eng
-#
-# Permissions & Intents
-#   • Invite with scopes: bot, applications.commands
-#   • Permissions: View Channels, Send Messages, Read Message History, Use Slash Commands
-#   • Dev Portal → Bot → Privileged Gateway Intents → enable MESSAGE CONTENT (and Server Members recommended)
-#
-import os, re, asyncio, logging, urllib.parse, json, time, io
-from typing import Optional, Tuple, List, Dict, Any
-from dataclasses import dataclass
+# In Discord Developer Portal → Bot: enable "Message Content Intent".
+
+import os, re, json, asyncio, logging
+from typing import Optional, Tuple, List, Dict
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-
 import aiohttp
+from aiohttp import web
 
-VERSION = "1.5.0-final"
-
-# ---------- Logging ----------
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s:%(name)s: %(message)s")
 log = logging.getLogger("bot")
 
-# ---------- Intents ----------
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-# ---------- Bot ----------
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# ---------- Env ----------
+# ---------------- Env ----------------
 load_dotenv()
+
 TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN not found. Put DISCORD_TOKEN=... in your .env")
-
 FORWARD_USER_ID = int(os.getenv("FORWARD_USER_ID", "0"))
-GLOBAL_MIN_ROI = float(os.getenv("MIN_ROI", "20"))
-BLOCK_ALERTS = {s.strip().lower() for s in os.getenv("BLOCK_ALERT_KEYWORDS", "IP,PL").split(",") if s.strip()}
-WATCH_IDS_ENV = [int(s.strip()) for s in os.getenv("WATCH_CHANNEL_IDS", "").split(",") if s.strip().isdigit()]
-FALLBACK_TO_CHANNEL_ON_DM_FAIL = os.getenv("FALLBACK_TO_CHANNEL_ON_DM_FAIL", "true").lower() in {"1","true","yes","on"}
 
-# OCR config
-OCR_PROVIDER = (os.getenv("OCR_PROVIDER") or "").lower().strip()
-OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "").strip()
-OCR_LANG = os.getenv("OCR_LANG", "eng")
+MIN_PROFIT = float(os.getenv("MIN_PROFIT", "5"))
+MIN_ROI = float(os.getenv("MIN_ROI", "8"))
+ALLOW_UNKNOWN_ELIG = os.getenv("ALLOW_UNKNOWN_ELIG", "false").lower() in {"1","true","yes","on"}
 
-WATCHED_CHANNELS: set[int] = set(WATCH_IDS_ENV)
+DEFAULT_BUY = float(os.getenv("DEFAULT_BUY", "0"))
 
-# ---------- Persistence (config.json) ----------
+KEEPA_KEY = os.getenv("KEEPA_KEY")
+KEEPA_DOMAIN_RAW = (os.getenv("KEEPA_DOMAIN") or "GB").strip()
+
+OCRSPACE_KEY = (os.getenv("OCRSPACE_KEY") or "").strip()
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-DEFAULT_CONFIG = {"guilds":{}, "links":{}}
 
-def load_config() -> Dict[str, Any]:
+# ---------------- Config persistence ----------------
+def _default_config() -> Dict:
+    return {
+        "watch_all": False,
+        "watched_channels": []  # list[int]
+    }
+    
+def load_config() -> Dict:
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return json.loads(json.dumps(DEFAULT_CONFIG))
-    except Exception as e:
-        log.exception("Failed to load config.json: %s", e); return json.loads(json.dumps(DEFAULT_CONFIG))
+            cfg = json.load(f)
+            if not isinstance(cfg, dict):
+                return _default_config()
+            cfg.setdefault("watch_all", False)
+            cfg.setdefault("watched_channels", [])
+            return cfg
+    except Exception:
+        return _default_config()
 
-def save_config(cfg: Dict[str, Any]):
+def save_config(cfg: Dict) -> None:
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:
-        log.exception("Failed to save config.json: %s", e)
+        log.warning("Failed to write config: %s", e)
 
-CONFIG = load_config()
+CFG = load_config()
 
-def get_guild_settings(guild_id: int) -> Dict[str, Any]:
-    g = CONFIG.setdefault("guilds", {})
-    return g.setdefault(str(guild_id), {
-        "min_roi": GLOBAL_MIN_ROI,
-        "dm_enabled": True,
-        "allow_missing_eligibility": False,
-        "log_channel_id": None,
-        "dedupe_hours": 6.0
-    })
+# ---------------- Discord ----------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-def set_guild_settings(guild_id: int, **kwargs):
-    s = get_guild_settings(guild_id)
-    s.update({k:v for k,v in kwargs.items() if v is not None})
-    save_config(CONFIG)
+# ---------------- Regex & helpers ----------------
+ASIN_RE = re.compile(r"\b([A-Z0-9]{10})\b", re.I)
+ROI_RE = re.compile(r"\bROI[:\s]([0-9]+(?:\.[0-9]+)?)\s%?", re.I)
+ELIG_RE = re.compile(r"\bEligibl\w*[:\s-]*([Yy]es|[Nn]o|Unknown)\b")
+MONEY_RE = re.compile(r"£\s*([0-9]+(?:\.[0-9]{1,2})?)")
 
-def set_channel_link(source_channel_id: int, dest_channel_id: Optional[int]):
-    links = CONFIG.setdefault("links", {})
-    if dest_channel_id is None:
-        links.pop(str(source_channel_id), None)
-    else:
-        links[str(source_channel_id)] = int(dest_channel_id)
-    save_config(CONFIG)
+def money(n: Optional[float]) -> str:
+    return "—" if n is None else f"£{n:.2f}"
 
-def get_link_destination(source_channel_id: int) -> Optional[int]:
-    v = CONFIG.get("links", {}).get(str(source_channel_id))
-    return int(v) if v is not None else None
+def pct(n: Optional[float]) -> str:
+    return "—" if n is None else f"{n:.2f}%"
 
-# ---------- Dedupe (runtime) ----------
-DEDUP_CACHE: Dict[int, Dict[str, float]] = {}
-def should_dedupe(guild_id: int, asin_list: List[str], hours: float) -> List[str]:
-    now = time.time(); win = hours*3600.0
-    store = DEDUP_CACHE.setdefault(guild_id, {}); keep = []
-    for a in asin_list:
-        t = store.get(a, 0)
-        if now - t >= win:
-            keep.append(a); store[a] = now
-    return keep
-
-# ---------- Parsing ----------
-ROI_RE = re.compile(r"(?:ROI|R\.?O\.?I\.?|Return\s+on\s+Investment|Est(?:imated)?\s*ROI)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%", re.IGNORECASE)
-ELIG_RE = re.compile(r"(?:Elig(?:ibility)?|Eligible)\s*[:=]?\s*(Yes|No)", re.IGNORECASE)
-ALERT_LINE_RE = re.compile(r"Alerts?\s*[:=]?\s*(.*)", re.IGNORECASE)
-AMAZON_URL_RE = re.compile(r"https?://(?:www\.)?amazon\.[^\s)>\]]+", re.IGNORECASE)
-BLOCK_TOKEN_RE = re.compile(r"\b(ip|pl)\b", re.IGNORECASE)
-IP_PHRASES = ["ip alert","ip-alert","ip alert:","ip violation"]
-
-# Extra extractors
-ASIN_TOKEN_RE = re.compile(r"\b(B0[A-Z0-9]{8})\b", re.IGNORECASE)
-BUY_RE  = re.compile(r"\bBuy\s*[:=]\s*[£$€]?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
-SELL_RE = re.compile(r"\bSell\s*[:=]\s*[£$€]?\s*([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
-WAS_RE  = re.compile(r"\bWas\s*[:=]\s*[£$€]?\s*([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
-NOW_RE  = re.compile(r"\bNow\s*[:=]\s*[£$€]?\s*([0-9]+(?:\.[0-9]{1,2})?)", re.IGNORECASE)
-
-def extract_asins_from_text(text: str) -> List[str]:
-    return [m.group(1).upper() for m in ASIN_TOKEN_RE.finditer(text or "")]
-
-def extract_asins_from_embeds(embeds: List[discord.Embed]) -> List[str]:
-    found = []
-    for e in embeds:
-        parts = []
-        if e.title: parts.append(e.title)
-        if e.description: parts.append(e.description)
-        for f in (e.fields or []): parts.append(f"{f.name}: {f.value}")
-        if e.footer and e.footer.text: parts.append(e.footer.text)
-        blob = "\n".join(parts)
-
-        # ASIN tokens
-        found.extend(extract_asins_from_text(blob))
-
-        # Amazon links inside text
-        for u in AMAZON_URL_RE.findall(blob or ""):
-            a = extract_asin_from_url(u)
-            if a: found.append(a)
-
-        # Title hyperlink (embed.url)
-        try:
-            if e.url:
-                a = extract_asin_from_url(str(e.url))
-                if a: found.append(a)
-        except Exception:
+def parse_domain_candidates(raw: str) -> List[int]:
+    mapping = {
+        "US": 1, "COM": 1,
+        "UK": 2, "GB": 2, "CO.UK": 2,
+        "DE": 3, "GERMANY": 3,
+        "FR": 4, "FRANCE": 4,
+        "JP": 5, "CO.JP": 5, "JAPAN": 5,
+        "CA": 6, "CANADA": 6,
+        "IT": 7, "ITALY": 7,
+        "ES": 8, "SPAIN": 8,
+        "IN": 9, "INDIA": 9,
+        "MX": 10, "MEXICO": 10,
+        "BR": 11, "BRAZIL": 11,
+        "AU": 12, "AUSTRALIA": 12,
+        "NL": 15, "NETHERLANDS": 15,
+    }
+    
+    # All available Keepa domains in priority order
+    all_domains = [2, 3, 1, 4, 7, 8, 15, 6, 5, 9, 10, 12, 11]  # UK, DE, US, FR, IT, ES, NL, CA, JP, IN, MX, AU, BR
+    
+    cands: List[int] = []
+    
+    # If user specified a domain, try it first
+    if raw.isdigit():
+        try: 
+            user_domain = int(raw)
+            if user_domain in all_domains:
+                cands.append(user_domain)
+        except: 
             pass
+    else:
+        user_domain = mapping.get(raw.upper())
+        if user_domain and user_domain in all_domains:
+            cands.append(user_domain)
+    
+    # If no user domain or not found, default to UK first
+    if not cands:
+        cands.append(2)
+    
+    # Add ALL other domains as fallbacks to maximize chance of finding price
+    for d in all_domains:
+        if d not in cands:
+            cands.append(d)
+    
+    return cands
 
-    # de-dup preserve order
-    out, seen = [], set()
-    for a in found:
-        if a not in seen:
-            seen.add(a); out.append(a)
-    return out
+KEEPA_DOMAINS_TO_TRY = parse_domain_candidates(KEEPA_DOMAIN_RAW)
 
-def extract_asin_from_url(url: str) -> Optional[str]:
+def amazon_url_for_domain(asin: str, domain_id: int) -> str:
+    host = {
+        1: "www.amazon.com",          # US
+        2: "www.amazon.co.uk",        # UK
+        3: "www.amazon.de",           # Germany
+        4: "www.amazon.fr",           # France
+        5: "www.amazon.co.jp",        # Japan
+        6: "www.amazon.ca",           # Canada
+        7: "www.amazon.it",           # Italy
+        8: "www.amazon.es",           # Spain
+        9: "www.amazon.in",           # India
+        10: "www.amazon.com.mx",      # Mexico
+        11: "www.amazon.com.br",      # Brazil
+        12: "www.amazon.com.au",      # Australia
+        15: "www.amazon.nl",          # Netherlands
+    }.get(domain_id, "www.amazon.co.uk")
+    return f"https://{host}/dp/{asin}"
+
+async def try_dm(user_id: int, content: str = "", embed: Optional[discord.Embed] = None) -> bool:
+    if not user_id: return False
     try:
-        parsed = urllib.parse.urlparse(url); path = parsed.path
-        m = re.search(r"/dp/([A-Z0-9]{10})(?:/|$)", path, re.IGNORECASE)
-        if not m: m = re.search(r"/gp/(?:product|aw/d)/([A-Z0-9]{10})(?:/|$)", path, re.IGNORECASE)
-        if m: return m.group(1).upper()
-        qs = urllib.parse.parse_qs(parsed.query or "")
-        asin_vals = qs.get("asin") or qs.get("ASIN")
-        if asin_vals:
-            cand = (asin_vals[0] or "").strip().upper()
-            if re.fullmatch(r"[A-Z0-9]{10}", cand):
-                return cand
-    except Exception:
-        pass
-    return None
-
-def build_sas_url(asin: str, cost: Optional[float]=None, sale: Optional[float]=None, source_url: Optional[str]=None) -> str:
-    base = "https://sas.selleramp.com/sas/lookup"
-    params = {"asin": asin}
-    if cost is not None: params["sas_cost_price"] = f"{cost:.2f}"
-    if sale is not None: params["sas_sale_price"] = f"{sale:.2f}"
-    if source_url: params["source_url"] = source_url
-    return f"{base}?{urllib.parse.urlencode(params)}"
-
-def approximate_roi_from_buy_sell(text: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Return (roi, buy, sell) using either Buy/Sell or Was/Now (as fallback)."""
-    mb = BUY_RE.search(text or ""); ms = SELL_RE.search(text or "")
-    if mb and ms:
-        try:
-            buy = float(mb.group(1)); sell = float(ms.group(1))
-            if buy > 0:
-                return round((sell-buy)/buy*100,2), buy, sell
-        except Exception: pass
-    mw = WAS_RE.search(text or ""); mn = NOW_RE.search(text or "")
-    if mw and mn:
-        try:
-            was = float(mw.group(1)); now = float(mn.group(1))
-            if now > 0:
-                return round((was-now)/now*100,2), now, was
-        except Exception: pass
-    return None, None, None
-
-@dataclass
-class LeadDecision:
-    eligible: Optional[bool]
-    roi: Optional[float]
-    has_block_alert: bool
-    ok: bool
-    reason: str
-
-def parse_text_block(text: str) -> Tuple[Optional[bool], Optional[float], bool]:
-    eligible = None; roi = None; has_block = False
-    m = ELIG_RE.search(text); 
-    if m: eligible = (m.group(1).strip().lower()=="yes")
-    m = ROI_RE.search(text); 
-    if m: roi = float(m.group(1))
-    for line in text.splitlines():
-        am = ALERT_LINE_RE.search(line)
-        if am and BLOCK_TOKEN_RE.search(am.group(1).lower()):
-            has_block=True; break
-    if not has_block and any(p in text.lower() for p in IP_PHRASES): has_block=True
-    return eligible, roi, has_block
-
-def evaluate_message_text(text: str, min_roi: float, allow_missing_eligibility: bool) -> LeadDecision:
-    eligible, roi, has_block = parse_text_block(text)
-    if roi is None:
-        approx, _, _ = approximate_roi_from_buy_sell(text); roi = approx
-    ok=True; reasons: List[str]=[]
-    if eligible is False:
-        ok=False; reasons.append("Eligibility = No")
-    if eligible is None and not allow_missing_eligibility:
-        ok=False; reasons.append("Eligibility not found")
-    if roi is None:
-        ok=False; reasons.append("ROI not found")
-    elif roi < min_roi:
-        ok=False; reasons.append(f"ROI {roi}% < {min_roi}%")
-    if has_block:
-        ok=False; reasons.append("Blocked (IP/PL/IP Alert)")
-    return LeadDecision(eligible, roi, has_block, ok, "; ".join(reasons) if reasons else "Pass")
-
-async def send_log(guild: discord.Guild, message: str):
-    gs = get_guild_settings(guild.id); ch_id = gs.get("log_channel_id")
-    if not ch_id: return
-    ch = guild.get_channel(int(ch_id)) or await bot.fetch_channel(int(ch_id))
-    try: await ch.send(message[:1900])
-    except Exception as e: log.warning("log send failed: %s", e)
-
-async def forward_good_lead(msg: discord.Message, roi: float, extra: str, dm_enabled: bool):
-    summary = f"Eligibility: Yes | ROI: {roi}% | Channel: #{getattr(msg.channel,'name',msg.channel.id)}"
-    if extra: summary += "\n" + extra
-    did = False
-    if dm_enabled and FORWARD_USER_ID:
-        try:
-            u = await bot.fetch_user(FORWARD_USER_ID)
-            dm = await u.create_dm(); await dm.send(f"**Approved Lead**\n{summary}\nJump: {msg.jump_url}")
-            did = True
-        except discord.Forbidden:
-            if FALLBACK_TO_CHANNEL_ON_DM_FAIL: await msg.reply(f"Approved lead →\n{summary}"); did=True
-        except Exception: pass
-    if not did and not dm_enabled:
-        await msg.reply(f"Approved lead →\n{summary}"); did=True
-    await send_log(msg.guild, f"✅ Approved in <#{msg.channel.id}> (ROI {roi}%). {msg.jump_url}")
-    # Relay
-    dest_id = get_link_destination(msg.channel.id)
-    if dest_id:
-        dest = bot.get_channel(dest_id)
-        if dest:
-            emb = discord.Embed(title="Approved Lead (Relayed)", description=f"From **{msg.guild.name}** #{getattr(msg.channel,'name',msg.channel.id)}", color=0x00AAFF)
-            emb.add_field(name="Summary", value=summary[:1024], inline=False)
-            emb.add_field(name="Jump to Source", value=msg.jump_url, inline=False)
-            try: await dest.send(embed=emb)
-            except Exception as e: log.warning("relay failed: %s", e)
-
-# ---------- OCR ----------
-async def ocr_image_from_url(session: aiohttp.ClientSession, url: str) -> str:
-    """Return extracted text from an image URL using configured OCR provider. Returns '' on failure."""
-    if not OCR_PROVIDER: return ""
-    try:
-        if OCR_PROVIDER == "ocrspace" and OCRSPACE_API_KEY:
-            api = "https://api.ocr.space/parse/imageurl"
-            data = {"apikey": OCRSPACE_API_KEY, "url": url, "OCREngine": 2, "isOverlayRequired": False, "language": OCR_LANG}
-            async with session.post(api, data=data, timeout=30) as r:
-                js = await r.json()
-                if js.get("IsErroredOnProcessing"): return ""
-                results = js.get("ParsedResults") or []
-                if results: return results[0].get("ParsedText") or ""
-                return ""
-        elif OCR_PROVIDER == "pytesseract":
-            try:
-                from PIL import Image
-                import pytesseract
-            except Exception:
-                log.warning("pytesseract not available")
-                return ""
-            async with session.get(url) as resp:
-                b = await resp.read()
-            im = Image.open(io.BytesIO(b))
-            return pytesseract.image_to_string(im)
+        u = await bot.fetch_user(user_id)
+        if embed: await u.send(content=content, embed=embed)
+        else:     await u.send(content)
+        return True
     except Exception as e:
-        log.warning("OCR error: %s", e)
-    return ""
+        log.info("DM failed: %s", e)
+        return False
 
-# ---------- Events ----------
+def extract_from_text(txt: str):
+    asin = None; buy=None; sell=None; roi=None; elig=None
+    m = ASIN_RE.search(txt)
+    if m: asin = m.group(1).upper()
+
+    mb = re.search(r"\b(Buy|Cost|Price)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
+    if mb: buy = float(mb.group(2))
+    ms = re.search(r"\b(Sell|Sale|SP)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
+    if ms: sell = float(ms.group(2))
+
+    m = ROI_RE.search(txt)
+    if m: roi = float(m.group(1))
+    m = ELIG_RE.search(txt)
+    if m: elig = m.group(1).capitalize()
+
+    t = txt.lower()
+    has_ip_pl = (" ip " in f" {t} ") or ("ip alert" in t) or ("private label" in t) or re.search(r"\bPL\b", txt)
+    return asin, buy, sell, roi, elig, bool(has_ip_pl)
+
+def compute_profit_roi(buy: Optional[float], sell: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    if buy is None or sell is None:
+        return None, None
+    profit = round(sell - buy, 2)
+    roi = round((profit / buy) * 100.0, 2) if buy > 0 else None
+    return profit, roi
+
+# ---------------- Message → Plain text ----------------
+def message_to_plaintext(msg: discord.Message) -> str:
+    """
+    Rewrites a Discord message (content + embeds) into plain text our regex can parse.
+    Includes titles, descriptions, fields, footers, authors, links, image URLs, and attachment names.
+    """
+    parts: List[str] = []
+
+    if msg.content:
+        parts.append(msg.content)
+
+    for e in msg.embeds:
+        if e.title:
+            parts.append(e.title)
+        if e.author and e.author.name:
+            parts.append(f"By: {e.author.name}")
+        if e.description:
+            parts.append(e.description)
+        for f in e.fields:
+            name = (f.name or "").strip()
+            val = (f.value or "").strip()
+            if name or val:
+                parts.append(f"{name}\n{val}" if name else val)
+        if e.footer and e.footer.text:
+            parts.append(e.footer.text)
+        if e.url:
+            parts.append(e.url)
+        if e.image and e.image.url:
+            parts.append(f"[image] {e.image.url}")
+        if e.thumbnail and e.thumbnail.url:
+            parts.append(f"[image] {e.thumbnail.url}")
+
+    for a in msg.attachments:
+        parts.append(f"[attachment] {a.filename}")
+        # OCR fallback will pull text from image URLs directly; we don't download here.
+
+    text = "\n".join(p for p in parts if p and p.strip())
+    text = re.sub(r"[•·▪▶]", "-", text)  # normalize bullet chars
+    text = re.sub(r"\u200b", "", text)   # zero-width
+    return text
+
+# ---------------- OCR Fallback (optional) ----------------
+async def ocr_try_extract_from_images(message: discord.Message) -> str:
+    """Use OCR.space to extract text from images (if OCRSPACE_KEY is set)."""
+    if not OCRSPACE_KEY:
+        return ""
+
+    urls: List[str] = []
+    for e in message.embeds:
+        if e.image and e.image.url: urls.append(e.image.url)
+        if e.thumbnail and e.thumbnail.url: urls.append(e.thumbnail.url)
+    for a in message.attachments:
+        if a.content_type and a.content_type.startswith("image/"):
+            urls.append(a.url)
+        else:
+            # crude fallback by extension if content_type missing
+            if a.filename.lower().endswith((".png",".jpg",".jpeg",".webp",".bmp",".gif")):
+                urls.append(a.url)
+
+    if not urls:
+        return ""
+
+    ocr_texts: List[str] = []
+    api = "https://api.ocr.space/parse/imageurl"
+    timeout = aiohttp.ClientTimeout(total=45)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for u in urls[:3]:  # keep it light
+            try:
+                payload = {
+                    "apikey": OCRSPACE_KEY,
+                    "url": u,
+                    "language": "eng",
+                    "isOverlayRequired": "false",
+                    "OCREngine": "2",
+                }
+                async with session.post(api, data=payload) as r:
+                    js = await r.json(content_type=None)
+                parsed = js.get("ParsedResults") or []
+                for pr in parsed:
+                    t = pr.get("ParsedText") or ""
+                    if t.strip():
+                        ocr_texts.append(t)
+            except Exception as e:
+                log.info("OCR error for %s: %s", u, e)
+
+    return "\n".join(ocr_texts)
+
+# ---------------- Keepa (very robust) ----------------
+async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Optional[float], Optional[str], Optional[str], str, Optional[int]]:
+    """
+    Returns (sell_price, brand, title, diag_text, domain_used).
+    Tries multiple domains. Pulls price from stats, stats.current and csv fallbacks.
+    Handles dict/list shapes and weird returns.
+    """
+    if not KEEPA_KEY:
+        return None, None, None, "Keepa disabled: KEEPA_KEY not set.", None
+
+    def cents(v):
+        return round(v / 100.0, 2) if isinstance(v, (int, float)) and v > 0 else None
+
+    async def fetch_once(domain: int):
+        url = "https://api.keepa.com/product"
+        params = {"key": KEEPA_KEY, "domain": domain, "asin": asin, "history": 1, "stats": 90}
+        try:
+            async with session.get(url, params=params, timeout=25) as r:
+                status = r.status
+                raw = await r.text()
+
+            try:
+                js = json.loads(raw)
+            except Exception:
+                return None, None, None, f"Invalid JSON domain={domain} status={status}: {raw[:200]}", None
+
+            while isinstance(js, list) and js:
+                js = js[0]
+            if not isinstance(js, dict):
+                return None, None, None, f"Unexpected JSON type {type(js)._name_} domain={domain}", None
+
+            products = js.get("products")
+            if isinstance(products, list):
+                if not products:
+                    return None, None, None, f"No products domain={domain}", None
+                p = products[0]
+            elif isinstance(products, dict):
+                p = products
+            else:
+                return None, None, None, f"Invalid 'products' type={type(products)._name_} domain={domain}", None
+
+            if not isinstance(p, dict):
+                return None, None, None, f"Bad product data type={type(p)._name_} domain={domain}", None
+
+            stats = p.get("stats") or {}
+            if isinstance(stats, list): stats = {}
+            current = stats.get("current") if isinstance(stats, dict) else None
+            if not isinstance(current, dict): current = {}
+
+            csv = p.get("csv") or {}
+            if isinstance(csv, list): csv = {}
+
+            price = None
+            # 1) stats.*
+            for key in ("buyBoxPrice", "buyBoxShipping", "newPrice", "amazonPrice"):
+                price = cents(stats.get(key))
+                if price: break
+            # 2) stats.current.*
+            if not price:
+                for key in ("buyBoxPrice", "buyBoxShipping", "newPrice", "amazonPrice"):
+                    price = cents(current.get(key))
+                    if price: break
+            # 3) CSV fallbacks
+            if not price and isinstance(csv, dict):
+                def iter_series():
+                    for k, arr in csv.items():
+                        name = str(k).lower()
+                        if any(t in name for t in ("buy", "box", "amazon", "new")) and isinstance(arr, list):
+                            yield arr
+                for series in iter_series():
+                    for x in reversed(series):
+                        if isinstance(x, (int, float)) and x > 0:
+                            price = cents(x); break
+                    if price: break
+
+            brand = (p.get("brand") or "").strip()
+            title = (p.get("title") or "").strip()
+            note = f"OK domain={domain} status={status}" if (price or brand or title) else f"No usable price domain={domain}"
+            return price, brand, title, note, domain
+
+        except asyncio.TimeoutError:
+            return None, None, None, f"Timeout domain={domain}", None
+        except Exception as e:
+            return None, None, None, f"Exception domain={domain}: {e}", None
+
+    diags = []
+    domain_names = {1: "US", 2: "UK", 3: "DE", 4: "FR", 5: "JP", 6: "CA", 7: "IT", 8: "ES", 9: "IN", 10: "MX", 11: "BR", 12: "AU", 15: "NL"}
+    
+    log.info(f"Trying {len(KEEPA_DOMAINS_TO_TRY)} Keepa domains for ASIN {asin}: {[domain_names.get(d, d) for d in KEEPA_DOMAINS_TO_TRY]}")
+    
+    for d in KEEPA_DOMAINS_TO_TRY:
+        price, brand, title, note, used = await fetch_once(d)
+        diags.append(note)
+        if price is not None:
+            log.info(f"✓ Found price on {domain_names.get(d, d)} domain: {price}")
+            return price, brand, title, " | ".join(diags), used
+        elif brand or title:
+            log.info(f"✓ Found product info on {domain_names.get(d, d)} domain (no price)")
+            return price, brand, title, " | ".join(diags), used
+    
+    log.warning(f"✗ No price found on any of {len(KEEPA_DOMAINS_TO_TRY)} domains")
+    return None, None, None, " | ".join(diags), None
+
+# ---------------- Decisions ----------------
+def decide(eligibility: Optional[str], profit: Optional[float], roi: Optional[float], ip_pl: bool) -> Tuple[bool, str]:
+    if ip_pl:
+        return False, "Blocked (IP/Private Label)"
+    if eligibility:
+        if eligibility.lower().startswith("n"):
+            return False, "Eligibility: No"
+        if eligibility.lower().startswith("u") and not ALLOW_UNKNOWN_ELIG:
+            return False, "Eligibility unknown (disabled)"
+    else:
+        if not ALLOW_UNKNOWN_ELIG:
+            return False, "Eligibility missing (disabled)"
+    if profit is None or profit < MIN_PROFIT:
+        return False, f"Profit {'missing' if profit is None else '< min'}"
+    if roi is None or roi < MIN_ROI:
+        return False, f"ROI {'missing' if roi is None else '< min'}"
+    return True, "Approved"
+
+# ---------------- Lead handling ----------------
+async def handle_lead_message(message: discord.Message):
+    # Respect watch-all / watched
+    watch_all = CFG.get("watch_all", False)
+    watched = set(CFG.get("watched_channels", []))
+    
+    # If watch_all is disabled AND there's a watch list AND this channel isn't in it, skip
+    if not watch_all and watched and message.channel.id not in watched:
+        log.debug(f"Skipping channel #{message.channel.name} (not in watch list)")
+        return
+    
+    # If watch_all is disabled AND the watch list is empty, warn once but still process
+    if not watch_all and not watched:
+        log.warning(f"Processing message but no channels are watched! Use /watch_add or /watch_all")
+
+    # 1) Plain-text rewrite
+    txt = message_to_plaintext(message)
+
+    # 2) Extract from text first
+    asin, buy, sell, roi, elig, ip_pl = extract_from_text(txt)
+
+    # 3) OCR fallback if critical fields missing
+    if (buy is None or sell is None or roi is None or (not asin)):
+        ocr_text = await ocr_try_extract_from_images(message)
+        if ocr_text:
+            asin2, buy2, sell2, roi2, elig2, ip_pl2 = extract_from_text(ocr_text)
+            asin = asin or asin2
+            if buy is None:  buy = buy2
+            if sell is None: sell = sell2
+            if roi is None:  roi = roi2
+            if not elig:     elig = elig2
+            ip_pl = ip_pl or ip_pl2
+
+    if not asin:
+        log.info(f"No ASIN found, skipping message from #{message.channel.name}")
+        return
+    
+    log.info(f"✓ Found ASIN: {asin} in #{message.channel.name}")
+    log.info(f"  Initial data - Buy: {buy} | Sell: {sell} | ROI: {roi} | Elig: {elig}")
+
+    keepa_diag = ""
+    domain_used: Optional[int] = None
+    if sell is None or sell <= 0:
+        log.info(f"  Fetching Keepa data for {asin}...")
+        async with aiohttp.ClientSession() as session:
+            ks, brand, title, keepa_diag, domain_used = await keepa_fetch(session, asin)
+            if sell is None:
+                sell = ks  # only fill if we had nothing
+            log.info(f"  Keepa result - Sell: {sell} | Brand: {brand} | Domain: {domain_used}")
+
+    if buy is None and DEFAULT_BUY > 0:
+        buy = DEFAULT_BUY
+        log.info(f"  Using DEFAULT_BUY: {buy}")
+
+    profit, roi_calc = compute_profit_roi(buy, sell)
+    if roi is None:
+        roi = roi_calc
+    
+    log.info(f"  Final values - Buy: {buy} | Sell: {sell} | Profit: {profit} | ROI: {roi}")
+
+    ok, reason = decide(elig, profit, roi, ip_pl)
+    log.info(f"  Decision: {'✅ APPROVED' if ok else '❌ REJECTED'} - {reason}")
+
+    # Build links (use domain used if we have it; else first candidate)
+    amz_domain = domain_used if domain_used is not None else KEEPA_DOMAINS_TO_TRY[0]
+    amz_url = amazon_url_for_domain(asin, amz_domain)
+    sas_url = f"https://sas.selleramp.com/sas/lookup?asin={asin}&sas_cost_price={(buy or 0):.2f}&source_url={amz_url.replace(':','%3A').replace('/','%2F')}"
+
+    embed = discord.Embed(
+        title=("✅ Approved Lead" if ok else "❌ Not Approved"),
+        description=f"ASIN: *{asin}*",
+        color=0x18a558 if ok else 0xC23B22
+    )
+    embed.add_field(name="Buy", value=money(buy), inline=True)
+    embed.add_field(name="Sell", value=money(sell), inline=True)
+    embed.add_field(name="Profit", value=money(profit), inline=True)
+
+    # ROI field shows percent + (Sell, Buy)
+    roi_str = pct(roi)
+    roi_str += f"  (Sell {money(sell)}, Buy {money(buy)})"
+    embed.add_field(name="ROI", value=roi_str, inline=False)
+
+    embed.add_field(name="Eligibility", value=(elig or "Unknown"), inline=True)
+    embed.add_field(name="Links", value=f"[Amazon]({amz_url}) • [SAS]({sas_url})", inline=False)
+    if keepa_diag:
+        embed.set_footer(text=f"Keepa: {keepa_diag}")
+
+    await message.reply(embed=embed, mention_author=False)
+    await try_dm(FORWARD_USER_ID, f"Lead from #{message.channel.name}", embed)
+
+# ---------------- Health Check Server (for Digital Ocean/cloud platforms) ----------------
+HEALTH_CHECK_PORT = int(os.getenv("PORT", "8080"))
+health_check_app = None
+health_check_runner = None
+
+async def health_check_handler(request):
+    """Simple health check endpoint that returns 200 OK if bot is running."""
+    return web.json_response({
+        "status": "healthy",
+        "bot": {
+            "ready": bot.is_ready() if bot else False,
+            "user": str(bot.user) if bot and bot.user else None
+        }
+    }, status=200)
+
+async def start_health_check_server():
+    """Start the HTTP health check server on port 8080."""
+    global health_check_app, health_check_runner
+    try:
+        health_check_app = web.Application()
+        health_check_app.router.add_get("/", health_check_handler)
+        health_check_app.router.add_get("/health", health_check_handler)
+        
+        runner = web.AppRunner(health_check_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", HEALTH_CHECK_PORT)
+        await site.start()
+        health_check_runner = runner
+        log.info(f"✓ Health check server started on port {HEALTH_CHECK_PORT}")
+    except Exception as e:
+        log.warning(f"Failed to start health check server: {e}")
+
+# ---------------- Events ----------------
 @bot.event
 async def on_ready():
-    try: synced = await bot.tree.sync(); log.info("Synced %d commands", len(synced))
-    except Exception as e: log.exception("sync failed: %s", e)
-    log.info("Logged in as %s (ID: %s) | v%s", bot.user, bot.user.id, VERSION)
-    if WATCHED_CHANNELS: log.info("Watching channels: %s", ", ".join(map(str, WATCHED_CHANNELS)))
+    try:
+        synced = await bot.tree.sync()
+        log.info("Synced %d commands", len(synced))
+    except Exception as e:
+        log.exception("Slash sync failed: %s", e)
+    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+    log.info("Keepa domains: %s", KEEPA_DOMAINS_TO_TRY)
+    log.info("Watch-all: %s | Watched: %s", CFG.get("watch_all", False), CFG.get("watched_channels", []))
+    
+    # Start health check server for cloud deployments
+    await start_health_check_server()
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.id == bot.user.id: return
-    if WATCHED_CHANNELS and message.channel.id not in WATCHED_CHANNELS: return
-
-    # Build text blob from content + embeds
-    parts = [message.content or ""]
-    for e in message.embeds:
-        if e.title: parts.append(e.title)
-        if e.description: parts.append(e.description)
-        for f in (e.fields or []): parts.append(f"{f.name}: {f.value}")
-        if e.footer and e.footer.text: parts.append(e.footer.text)
-
-    blob = "\n".join([p for p in parts if p])
-
-    # If blob empty & images exist → OCR
-    if not blob.strip() and message.attachments:
-        async with aiohttp.ClientSession() as session:
-            for att in message.attachments:
-                if att.content_type and att.content_type.startswith("image"):
-                    txt = await ocr_image_from_url(session, att.url)
-                    if txt:
-                        blob += "\n" + txt
-
-    gs = get_guild_settings(message.guild.id)
-    min_roi = float(gs.get("min_roi", GLOBAL_MIN_ROI))
-    dm_enabled = bool(gs.get("dm_enabled", True))
-    allow_missing_elig = bool(gs.get("allow_missing_eligibility", False))
-    dedupe_hours = float(gs.get("dedupe_hours", 6.0))
-
-    urls = AMAZON_URL_RE.findall(blob)
-
-    # Collect ASINs
-    asin_candidates = []
-    for u in urls:
-        a = extract_asin_from_url(u)
-        if a: asin_candidates.append(a)
-    asin_candidates.extend(extract_asins_from_embeds(message.embeds))
-    asin_candidates.extend(extract_asins_from_text(blob))
-
-    seen=set(); asin_list=[]
-    for a in asin_candidates:
-        if a not in seen:
-            seen.add(a); asin_list.append(a)
-
-    approx_roi, buy_val, sell_val = approximate_roi_from_buy_sell(blob)
-
-    # Build SAS lines
-    asin_lines=[]
-    for asin in asin_list:
-        sas = build_sas_url(asin, cost=buy_val, sale=sell_val, source_url=(urls[0] if urls else None))
-        part = f"- **{asin}**"
-        if urls: part += f"\n  Amazon: {urls[0]}"
-        part += f"\n  SAS: {sas}"
-        asin_lines.append(part)
-
-    decision = evaluate_message_text(blob, min_roi=min_roi, allow_missing_eligibility=allow_missing_elig)
-
-    # Dedupe
-    new_asins = should_dedupe(message.guild.id, asin_list, dedupe_hours) if asin_list else asin_list
-
-    if decision.ok and decision.roi is not None:
-        if asin_list and not new_asins:
-            await send_log(message.guild, f"🟨 Dedupe skip in <#{message.channel.id}> — ASINs within {dedupe_hours}h: {', '.join(asin_list)}")
-            return
-        if asin_list and new_asins:
-            filtered = []
-            for asin, line in zip(asin_list, asin_lines):
-                if asin in new_asins: filtered.append(line)
-            extra = ("**Links**:\n" + "\n".join(filtered)) if filtered else ""
-        else:
-            extra = ("**Links**:\n" + "\n".join(asin_lines)) if asin_lines else ""
-        await forward_good_lead(message, decision.roi, extra, dm_enabled=dm_enabled)
-
+    if message.author.bot:
+        return
+    await handle_lead_message(message)
     await bot.process_commands(message)
 
-# ---------- Commands ----------
-@bot.tree.command(name="watch_add", description="Add a channel to the watch list (current if omitted)")
-@app_commands.describe(channel="Channel to watch; defaults to current")
-async def watch_add(interaction: discord.Interaction, channel: Optional[discord.TextChannel]=None):
+# ---------------- Slash commands ----------------
+@bot.tree.command(name="watch_add", description="Start watching this channel (or pick another)")
+async def watch_add(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
     ch = channel or interaction.channel
-    WATCHED_CHANNELS.add(ch.id)
+    watched = set(CFG.get("watched_channels", []))
+    watched.add(ch.id)
+    CFG["watched_channels"] = list(watched)
+    save_config(CFG)
     await interaction.response.send_message(f"Now watching <#{ch.id}>.", ephemeral=True)
 
-@bot.tree.command(name="watch_remove", description="Remove a channel from the watch list")
+@bot.tree.command(name="watch_remove", description="Stop watching a channel")
 async def watch_remove(interaction: discord.Interaction, channel: discord.TextChannel):
-    WATCHED_CHANNELS.discard(channel.id)
+    watched = set(CFG.get("watched_channels", []))
+    watched.discard(channel.id)
+    CFG["watched_channels"] = list(watched)
+    save_config(CFG)
     await interaction.response.send_message(f"Stopped watching <#{channel.id}>.", ephemeral=True)
 
 @bot.tree.command(name="watch_list", description="List watched channels")
 async def watch_list(interaction: discord.Interaction):
-    if not WATCHED_CHANNELS:
-        await interaction.response.send_message("No channels are being watched.", ephemeral=True); return
-    names = []
-    for cid in WATCHED_CHANNELS:
-        c = interaction.client.get_channel(cid); names.append(f"<#{cid}>" if c else str(cid))
-    await interaction.response.send_message("Watching: " + ", ".join(names), ephemeral=True)
+    watched = CFG.get("watched_channels", [])
+    wa = CFG.get("watch_all", False)
+    if wa:
+        txt = "Watching *all channels*."
+    elif not watched:
+        txt = "No watched channels."
+    else:
+        names=[]
+        for cid in watched:
+            c = interaction.client.get_channel(cid)
+            names.append(f"<#{cid}>" if c else str(cid))
+        txt = "Watching: " + ", ".join(names)
+    await interaction.response.send_message(txt, ephemeral=True)
 
-@bot.tree.command(name="settings", description="Show current filter & relay settings")
-async def settings(interaction: discord.Interaction):
-    gs = get_guild_settings(interaction.guild.id)
-    link = get_link_destination(interaction.channel.id)
+@bot.tree.command(name="watch_all", description="Toggle watching ALL channels (on/off)")
+async def watch_all(interaction: discord.Interaction, on: bool):
+    CFG["watch_all"] = bool(on)
+    save_config(CFG)
+    await interaction.response.send_message(f"Watch-all set to *{CFG['watch_all']}*.", ephemeral=True)
+
+@bot.tree.command(name="watch_add_all", description="Add ALL text channels in this server to the watch list")
+async def watch_add_all(interaction: discord.Interaction):
+    watched = set(CFG.get("watched_channels", []))
+    for ch in interaction.guild.text_channels:
+        watched.add(ch.id)
+    CFG["watched_channels"] = list(watched)
+    save_config(CFG)
+    await interaction.response.send_message(f"Added *{len(interaction.guild.text_channels)}* channels to watch list.", ephemeral=True)
+
+@bot.tree.command(name="watch_clear", description="Clear the watched channel list (keeps watch-all setting)")
+async def watch_clear(interaction: discord.Interaction):
+    CFG["watched_channels"] = []
+    save_config(CFG)
+    await interaction.response.send_message("Cleared watched channels.", ephemeral=True)
+
+@bot.tree.command(name="settings", description="Show current filter & watch settings")
+async def settings_cmd(interaction: discord.Interaction):
+    watched = CFG.get("watched_channels", [])
     await interaction.response.send_message(
-        f"MIN_ROI (guild): {gs.get('min_roi')}%\n"
-        f"DM enabled: {gs.get('dm_enabled')}\n"
-        f"Allow missing Eligibility: {gs.get('allow_missing_eligibility')}\n"
-        f"Dedupe hours: {gs.get('dedupe_hours')}\n"
-        f"Log channel: {('<#'+str(gs.get('log_channel_id'))+'>') if gs.get('log_channel_id') else 'None'}\n"
-        f"Fallback to channel on DM fail: {FALLBACK_TO_CHANNEL_ON_DM_FAIL}\n"
-        f"Relay link (this channel): {('<#'+str(link)+'>') if link else 'None'}",
+        f"*Filters*\n"
+        f"- Eligibility required: {'Yes' if not ALLOW_UNKNOWN_ELIG else 'No (unknown allowed)'}\n"
+        f"- Min Profit: {money(MIN_PROFIT)}\n"
+        f"- Min ROI: {MIN_ROI:.2f}%\n"
+        f"- Default Buy: {money(DEFAULT_BUY) if DEFAULT_BUY else '—'}\n"
+        f"*Keepa*\n"
+        f"- Domain input: {KEEPA_DOMAIN_RAW} → trying {KEEPA_DOMAINS_TO_TRY}\n"
+        f"- Key set: {'Yes' if bool(KEEPA_KEY) else 'No'}\n"
+        f"*Watch*\n"
+        f"- Watch-all: {CFG.get('watch_all', False)}\n"
+        f"- Watched: {watched if watched else '[]'}",
         ephemeral=True
     )
 
-@bot.tree.command(name="set_min_roi", description="Set MIN_ROI for this server (guild)")
-@app_commands.describe(value="Minimum ROI percentage (e.g., 20 for 20%)")
-async def set_min_roi(interaction: discord.Interaction, value: app_commands.Range[float, 0, 100]):
-    set_guild_settings(interaction.guild.id, min_roi=float(value))
-    await interaction.response.send_message(f"Set MIN_ROI for this server to {value}%.", ephemeral=True)
+@bot.tree.command(name="set_min_profit", description="Set minimum profit (£)")
+async def set_min_profit_cmd(interaction: discord.Interaction, value: float):
+    global MIN_PROFIT
+    MIN_PROFIT = float(value)
+    await interaction.response.send_message(f"Min profit set to {money(MIN_PROFIT)}", ephemeral=True)
 
-@bot.tree.command(name="toggle_dm", description="Turn DM notifications on or off for this server")
-@app_commands.describe(enabled="True to DM you; False for channel-only notifications")
-async def toggle_dm(interaction: discord.Interaction, enabled: bool):
-    set_guild_settings(interaction.guild.id, dm_enabled=bool(enabled))
-    await interaction.response.send_message(f"DM notifications set to: {enabled}", ephemeral=True)
+@bot.tree.command(name="set_min_roi", description="Set minimum ROI (%)")
+async def set_min_roi_cmd(interaction: discord.Interaction, value: float):
+    global MIN_ROI
+    MIN_ROI = float(value)
+    await interaction.response.send_message(f"Min ROI set to {MIN_ROI:.2f}%", ephemeral=True)
 
-@bot.tree.command(name="toggle_allow_missing_eligibility", description="Allow pass when Eligibility is missing (uses ROI + Alerts only)")
-@app_commands.describe(enabled="true or false")
-async def toggle_allow_missing_eligibility(interaction: discord.Interaction, enabled: bool):
-    set_guild_settings(interaction.guild.id, allow_missing_eligibility=bool(enabled))
-    await interaction.response.send_message(f"Allow missing Eligibility set to: {enabled}", ephemeral=True)
+@bot.tree.command(name="set_default_buy", description="Set default buy price for ASIN-only leads")
+async def set_default_buy_cmd(interaction: discord.Interaction, value: float):
+    global DEFAULT_BUY
+    DEFAULT_BUY = float(value)
+    await interaction.response.send_message(f"Default buy set to {money(DEFAULT_BUY)}", ephemeral=True)
 
-@bot.tree.command(name="set_dedupe_hours", description="Skip re-sending same ASIN within N hours (per guild)")
-@app_commands.describe(hours="Number of hours to dedupe (e.g., 6)")
-async def set_dedupe_hours(interaction: discord.Interaction, hours: app_commands.Range[float, 0, 168]):
-    set_guild_settings(interaction.guild.id, dedupe_hours=float(hours))
-    await interaction.response.send_message(f"Dedupe window set to {hours} hours.", ephemeral=True)
+@bot.tree.command(name="set_allow_unknown_elig", description="Allow or block unknown eligibility")
+async def set_allow_unknown_elig_cmd(interaction: discord.Interaction, allow: bool):
+    global ALLOW_UNKNOWN_ELIG
+    ALLOW_UNKNOWN_ELIG = bool(allow)
+    await interaction.response.send_message(f"Allow unknown eligibility: {ALLOW_UNKNOWN_ELIG}", ephemeral=True)
 
-@bot.tree.command(name="set_log_channel", description="Set a log channel for approvals and dedupe notices")
-async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    set_guild_settings(interaction.guild.id, log_channel_id=int(channel.id))
-    await interaction.response.send_message(f"Log channel set to <#{channel.id}>.", ephemeral=True)
-
-@bot.tree.command(name="link_channels", description="Link this channel to a destination channel for relay")
-@app_commands.describe(source="Source (defaults to current)", destination="Destination channel to forward approved leads into")
-async def link_channels(interaction: discord.Interaction, destination: discord.TextChannel, source: Optional[discord.TextChannel]=None):
-    src = source or interaction.channel
-    set_channel_link(src.id, destination.id)
-    await interaction.response.send_message(f"Linked <#{src.id}> → <#{destination.id}> for approved-lead relay.", ephemeral=True)
-
-@bot.tree.command(name="link_clear", description="Clear relay link for this channel")
-async def link_clear(interaction: discord.Interaction, channel: Optional[discord.TextChannel]=None):
-    ch = channel or interaction.channel
-    set_channel_link(ch.id, None)
-    await interaction.response.send_message(f"Cleared relay link for <#{ch.id}>.", ephemeral=True)
-
-@bot.tree.command(name="test_dm", description="Send me a test DM to verify DM delivery")
-async def test_dm(interaction: discord.Interaction):
-    try:
-        await interaction.user.send("✅ DM test from your AmazonLeadFilterBot worked!")
-        await interaction.response.send_message("Sent you a DM. Check your inbox!", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message("I couldn't DM you. Enable 'Allow DMs from server members' and try again.", ephemeral=True)
-
-@bot.tree.command(name="sas_link", description="Build a SellerAmp link for a given ASIN")
-@app_commands.describe(asin="The 10-character ASIN")
-async def sas_link(interaction: discord.Interaction, asin: str):
+@bot.tree.command(name="diag_asin", description="Check Keepa price/brand/title and show diagnostics")
+async def diag_asin(interaction: discord.Interaction, asin: str):
     asin = asin.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-        await interaction.response.send_message("Please provide a valid 10-character ASIN.", ephemeral=True); return
-    url = build_sas_url(asin)
-    await interaction.response.send_message(f"**SAS:** {url}", ephemeral=True)
-
-# -------- New utility: /asin_links --------
-MARKETS = {
-    "US": "https://www.amazon.com/dp/{asin}",
-    "UK": "https://www.amazon.co.uk/dp/{asin}",
-    "DE": "https://www.amazon.de/dp/{asin}",
-    "FR": "https://www.amazon.fr/dp/{asin}",
-    "IT": "https://www.amazon.it/dp/{asin}",
-    "ES": "https://www.amazon.es/dp/{asin}",
-    "CA": "https://www.amazon.ca/dp/{asin}",
-    "AU": "https://www.amazon.com.au/dp/{asin}",
-    "JP": "https://www.amazon.co.jp/dp/{asin}",
-    "IN": "https://www.amazon.in/dp/{asin}",
-}
-
-@bot.tree.command(name="asin_links", description="Build Amazon product links for multiple regions")
-@app_commands.describe(asin="10-character ASIN", tag="Optional affiliate tag (e.g., mytag-20)")
-async def asin_links(interaction: discord.Interaction, asin: str, tag: Optional[str] = None):
-    asin = asin.strip().upper()
-    if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-        await interaction.response.send_message("Please provide a valid 10-character ASIN.", ephemeral=True); return
-    lines = []
-    for region, tmpl in MARKETS.items():
-        u = tmpl.format(asin=asin)
-        if tag:
-            sep = "&" if "?" in u else "?"
-            u = f"{u}{sep}tag={tag}"
-        lines.append(f"{region}: {u}")
-    out = "\n".join(lines)
-    await interaction.response.send_message(out[:1900], ephemeral=True)
-
-@bot.tree.command(name="ping", description="Latency check")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Pong! {round(bot.latency*1000)} ms", ephemeral=True)
-
-@bot.tree.command(name="diag_last", description="Diagnose parsing of the most recent message in this channel")
-async def diag_last(interaction: discord.Interaction):
+        await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
-    channel = interaction.channel
-    msg=None
-    async for m in channel.history(limit=25):
-        if m.author.bot: continue
-        msg=m; break
-    if msg is None:
-        await interaction.followup.send("No recent user message found to diagnose.", ephemeral=True); return
+    async with aiohttp.ClientSession() as session:
+        sell, brand, title, diag, used = await keepa_fetch(session, asin)
+    amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
+    await interaction.followup.send(
+        f"ASIN: *{asin}*\n"
+        f"Brand: {brand or '—'}\n"
+        f"Title: {title or '—'}\n"
+        f"Sell: {money(sell)}\n"
+        f"Amazon: {amz_url}\n"
+        f"Diag: {diag}",
+        ephemeral=True
+    )
 
-    parts=[msg.content or ""]
-    for e in msg.embeds:
-        if e.title: parts.append(e.title)
-        if e.description: parts.append(e.description)
-        for f in (e.fields or []): parts.append(f"{f.name}: {f.value}")
-        if e.footer and e.footer.text: parts.append(e.footer.text)
-    blob="\n".join([p for p in parts if p])
+@bot.tree.command(name="calc_asin", description="Fetch Keepa price and compute ROI/Profit (uses default buy unless provided)")
+@app_commands.describe(asin="10-char ASIN", buy="Override buy price (defaults to DEFAULT_BUY)")
+async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[float] = None):
+    asin = asin.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+        await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    async with aiohttp.ClientSession() as session:
+        sell, brand, title, diag, used = await keepa_fetch(session, asin)
+    effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else None)
+    profit = roi = None
+    if effective_buy is not None and sell is not None:
+        profit, roi = compute_profit_roi(effective_buy, sell)
+    amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
+    await interaction.followup.send(
+        f"ASIN: *{asin}*\n"
+        f"Brand: {brand or '—'}\n"
+        f"Title: {title or '—'}\n"
+        f"Sell: {money(sell)} | Buy used: {money(effective_buy)}\n"
+        f"Profit: {money(profit)} | ROI: {pct(roi)}\n"
+        f"Amazon: {amz_url}\n"
+        f"Diag: {diag}",
+        ephemeral=True
+    )
 
-    gs = get_guild_settings(interaction.guild.id)
-    decision = evaluate_message_text(blob, min_roi=float(gs.get("min_roi", GLOBAL_MIN_ROI)), allow_missing_eligibility=bool(gs.get("allow_missing_eligibility", False)))
+# ------------- Context menu: Show Plain Text (right-click a message → Apps) -----
+@bot.tree.context_menu(name="Show Plain Text")
+async def show_plain_ctx(interaction: discord.Interaction, message: discord.Message):
+    txt = message_to_plaintext(message)
+    preview = txt if len(txt) <= 1800 else txt[:1800] + "\n…(truncated)…"
+    await interaction.response.send_message(f"text\n{preview}\n", ephemeral=True)
 
-    urls = AMAZON_URL_RE.findall(blob)
-    asin_candidates=[]
-    for u in urls:
-        a=extract_asin_from_url(u)
-        if a: asin_candidates.append(a)
-    asin_candidates.extend(extract_asins_from_embeds(msg.embeds))
-    asin_candidates.extend(extract_asins_from_text(blob))
-    seen=set(); asin_list=[]
-    for a in asin_candidates:
-        if a not in seen: seen.add(a); asin_list.append(a)
-    approx_roi, buy_val, sell_val = approximate_roi_from_buy_sell(blob)
-    asin_lines=[f"- {a}\n  SAS: {build_sas_url(a, cost=buy_val, sale=sell_val, source_url=(urls[0] if urls else None))}" for a in asin_list]
-
-    report=[
-        "**Diagnostics**",
-        f"Eligible parsed: {decision.eligible}",
-        f"ROI parsed: {decision.roi}",
-        f"Blocked alert: {decision.has_block_alert}",
-        f"OK to send: {decision.ok}",
-        f"Reason: {decision.reason}",
-        "",
-        f"Guild MIN_ROI: {gs.get('min_roi')}% | DM: {gs.get('dm_enabled')} | AllowMissingEligibility: {gs.get('allow_missing_eligibility')} | Dedupe: {gs.get('dedupe_hours')}h",
-        f"OCR: provider={OCR_PROVIDER or 'disabled'} lang={OCR_LANG}",
-        f"Approx ROI (Buy/Sell or Was/Now): {approx_roi}",
-        "",
-        f"ASINs: {', '.join(asin_list) if asin_list else '(none)'}",
-        *(asin_lines if asin_lines else ["(No SAS links)"]),
-        "",
-        f"Message link: {msg.jump_url}"
-    ]
-    out="\n".join(report)
-    if len(out)>1900: out=out[:1900]+"\n...(truncated)"
-    await interaction.followup.send(out, ephemeral=True)
-
-@bot.tree.command(name="status", description="Bot status & configuration overview")
-async def status_cmd(interaction: discord.Interaction):
-    links = CONFIG.get("links", {})
-    watching = ", ".join(f"<#{cid}>" for cid in WATCHED_CHANNELS) if WATCHED_CHANNELS else "none"
-    intents_status = f"message_content={bot.intents.message_content}, members={bot.intents.members}"
-    gs = get_guild_settings(interaction.guild.id)
-    lines=[
-        f"**Amazon Lead Filter Bot v{VERSION}**",
-        f"Intents: {intents_status}",
-        f"Watching (global): {watching}",
-        f"Guild MIN_ROI: {gs.get('min_roi')}% | DM: {gs.get('dm_enabled')} | AllowMissingEligibility: {gs.get('allow_missing_eligibility')} | Dedupe: {gs.get('dedupe_hours')}h",
-        f"OCR: provider={OCR_PROVIDER or 'disabled'} lang={OCR_LANG}",
-        f"Log channel: {('<#'+str(gs.get('log_channel_id'))+'>') if gs.get('log_channel_id') else 'None'}",
-        f"Config path: `{CONFIG_PATH}`",
-        f"Relay links mapped: {len(links)}"
-    ]
-    count=0
-    for k,v in links.items():
-        lines.append(f"• <#{k}> → <#{v}>"); count+=1
-        if count>=5: break
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-# ---------- Run ----------
+# ---------------- Run ----------------
 if __name__ == "__main__":
-    try: bot.run(TOKEN)
-    except KeyboardInterrupt: log.info("Shutting down…")
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN missing in .env")
+    bot.run(TOKEN)
