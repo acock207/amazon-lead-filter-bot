@@ -2,18 +2,19 @@ version: "3.8"
 services:
   leadbot:
     build:
-      context: .
-      dockerfile: deploy/Dockerfile   # or deploy/Dockerfile.pytesseract if using local OCR
+      context: ..
+      dockerfile: deploy/Dockerfile
     restart: unless-stopped
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
       FORWARD_USER_ID: ${FORWARD_USER_ID}
+      RAINFOREST_KEY: ${RAINFOREST_KEY}
       MIN_ROI: ${MIN_ROI:-20}
       FALLBACK_TO_CHANNEL_ON_DM_FAIL: ${FALLBACK_TO_CHANNEL_ON_DM_FAIL:-true}
       OCR_PROVIDER: ${OCR_PROVIDER:-ocrspace}
       OCRSPACE_API_KEY: ${OCRSPACE_API_KEY}
       OCR_LANG: ${OCR_LANG:-eng}
     volumes:
-      - ./config.json:/app/config.json
+      - ../config.json:/app/config.json
       # optional: mount .env if you prefer
       # - ./.env:/app/.env
