@@ -444,26 +444,33 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
                     if price: break
             if not price and isinstance(csv, dict):
                 def last_price_from_series(arr):
-                    val = None
-                    for x in reversed(arr):
+                    if not isinstance(arr, list) or not arr:
+                        return None
+                    if isinstance(arr[-1], (int, float)):
+                        v = arr[-1]
+                        if 0 < v <= 500000:
+                            return cents(v)
+                    for i in range(len(arr) - 1, -1, -2):
+                        x = arr[i]
                         if isinstance(x, (int, float)) and 0 < x <= 500000:
-                            val = cents(x); break
-                    return val
+                            return cents(x)
+                    return None
                 preferred = []
                 for k, arr in csv.items():
                     name = str(k).lower()
-                    if isinstance(arr, list) and any(t in name for t in ("buy", "box", "amazon", "new")):
+                    if isinstance(arr, list) and any(t in name for t in ("buy", "box", "bb", "amazon", "new")):
                         preferred.append(arr)
                 for series in preferred:
-                    price = last_price_from_series(series)
-                    if price:
+                    p2 = last_price_from_series(series)
+                    if p2:
+                        price = p2
                         break
                 if not price:
                     for arr in csv.values():
-                        if isinstance(arr, list):
-                            price = last_price_from_series(arr)
-                            if price:
-                                break
+                        p2 = last_price_from_series(arr)
+                        if p2:
+                            price = p2
+                            break
 
             if not price:
                 top_level_candidates = [p.get("listPrice"), (current.get("listPrice") if isinstance(current, dict) else None)]
@@ -904,8 +911,9 @@ async def set_allow_unknown_elig_cmd(interaction: discord.Interaction, allow: bo
     ALLOW_UNKNOWN_ELIG = bool(allow)
     await interaction.response.send_message(f"Allow unknown eligibility: {ALLOW_UNKNOWN_ELIG}", ephemeral=True)
 
-@bot.tree.command(name="diag_asin", description="Check Keepa price/brand/title and show diagnostics")
-async def diag_asin(interaction: discord.Interaction, asin: str):
+@bot.tree.command(name="diag_asin", description="Check product price/brand/title and show diagnostics")
+@app_commands.describe(asin="10-char ASIN", buy="Override buy price (optional)")
+async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[float] = None):
     asin = asin.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{10}", asin):
         await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=True); return
@@ -913,7 +921,7 @@ async def diag_asin(interaction: discord.Interaction, asin: str):
     async with aiohttp.ClientSession() as session:
         sell, brand, title, diag, used = await product_fetch(session, asin)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
-    effective_buy = DEFAULT_BUY if DEFAULT_BUY > 0 else None
+    effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else None)
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
@@ -921,7 +929,7 @@ async def diag_asin(interaction: discord.Interaction, asin: str):
         f"ASIN: *{asin}*\n"
         f"Brand: {brand or '—'}\n"
         f"Title: {title or '—'}\n"
-        f"Sell: {money(sell)} | Buy used: {money(effective_buy)}\n"
+        f"Sell: {money(sell)} | Buy: {money(effective_buy)}\n"
         f"Profit: {money(profit)} | ROI: {pct(roi)}\n"
         f"Amazon: {amz_url}\n"
         f"Diag: {diag}",
