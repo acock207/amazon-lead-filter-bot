@@ -93,6 +93,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------------- Regex & helpers ----------------
 ASIN_RE = re.compile(r"\b([A-Z0-9]{10})\b", re.I)
+ASIN_LABEL_RE = re.compile(r"\bASIN[:\s-]*([A-Z0-9]{10})\b", re.I)
+ASIN_LABEL_FLEX_RE = re.compile(r"\bASIN[:\s-]*([A-Z0-9\-\s]{10,})\b", re.I)
+AMAZON_URL_RE = re.compile(r"amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx|com\.br|com\.au|nl)/.*?/(?:dp|gp/product|product)/([A-Z0-9]{10})", re.I)
+B0_ASIN_RE = re.compile(r"\b(B0[A-Z0-9]{8})\b", re.I)
+B0_ASIN_FLEX_RE = re.compile(r"\bB\s*0[\s\-A-Z0-9]{8}\b", re.I)
 ROI_RE = re.compile(r"\bROI[:\s]([0-9]+(?:\.[0-9]+)?)\s%?", re.I)
 ELIG_RE = re.compile(r"\bEligibl\w*[:\s-]*([Yy]es|[Nn]o|Unknown)\b")
 MONEY_RE = re.compile(r"£\s*([0-9]+(?:\.[0-9]{1,2})?)")
@@ -110,18 +115,16 @@ def is_valid_asin(asin: str) -> bool:
     if not asin or len(asin) != 10:
         return False
     asin_upper = asin.upper()
-    # Reject common words
     if asin_upper in INVALID_ASIN_WORDS:
         return False
-    # Real ASINs typically start with B (new) or 0-9 (old), not common letter combinations
-    # They also usually have a mix of letters and numbers, not all letters
-    if asin_upper.isalpha() and not any(c.isdigit() for c in asin_upper):
-        # If it's all letters and doesn't start with B, be suspicious
-        if not asin_upper.startswith('B'):
-            # Check if it looks like a common English word pattern
-            if len(set(asin_upper)) < 6:  # Too few unique letters suggests a word
-                return False
+    has_letter = any(c.isalpha() for c in asin_upper)
+    has_digit = any(c.isdigit() for c in asin_upper)
+    if not (has_letter and has_digit):
+        return False
     return True
+
+def normalize_asin(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", s or "").upper()
 
 def money(n: Optional[float]) -> str:
     return "—" if n is None else f"£{n:.2f}"
@@ -221,13 +224,44 @@ def extract_from_text(txt: str):
             log.debug(f"✗ Rejected invalid ASIN candidate: {candidate}")
     
     # Also check for ASIN in Amazon URLs (more reliable)
-    amazon_url_pattern = r"amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx|com\.br|com\.au|nl)/.*?/(?:dp|gp/product|product)/([A-Z0-9]{10})"
-    url_match = re.search(amazon_url_pattern, txt, re.I)
+    url_match = AMAZON_URL_RE.search(txt)
     if url_match:
         url_asin = url_match.group(1).upper()
         if is_valid_asin(url_asin):
             asin = url_asin
             log.info(f"✓ Found ASIN from Amazon URL: {asin}")
+    
+    # Check explicit ASIN label
+    if not asin:
+        label_match = ASIN_LABEL_RE.search(txt)
+        if label_match:
+            label_asin = label_match.group(1).upper()
+            if is_valid_asin(label_asin):
+                asin = label_asin
+                log.info(f"✓ Found ASIN from label: {asin}")
+    if not asin:
+        label_flex = ASIN_LABEL_FLEX_RE.search(txt)
+        if label_flex:
+            cand = normalize_asin(label_flex.group(1))
+            if len(cand) == 10 and is_valid_asin(cand):
+                asin = cand
+                log.info(f"✓ Found ASIN from flexible label: {asin}")
+    
+    # Prefer typical B0-prefixed ASINs if still missing
+    if not asin:
+        b0_match = B0_ASIN_RE.search(txt)
+        if b0_match:
+            b0_asin = b0_match.group(1).upper()
+            if is_valid_asin(b0_asin):
+                asin = b0_asin
+                log.info(f"✓ Found B0 ASIN: {asin}")
+    if not asin:
+        b0_flex = B0_ASIN_FLEX_RE.search(txt)
+        if b0_flex:
+            cand = normalize_asin(b0_flex.group(0))
+            if len(cand) == 10 and is_valid_asin(cand):
+                asin = cand
+                log.info(f"✓ Found flexible B0 ASIN: {asin}")
 
     mb = re.search(r"\b(Buy|Cost|Price)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
     if mb: buy = float(mb.group(2))
@@ -239,8 +273,11 @@ def extract_from_text(txt: str):
     m = ELIG_RE.search(txt)
     if m: elig = m.group(1).capitalize()
 
-    t = txt.lower()
-    has_ip_pl = (" ip " in f" {t} ") or ("ip alert" in t) or ("private label" in t) or re.search(r"\bPL\b", txt)
+    has_ip_pl = bool(
+        re.search(r"\bip(?:\s+alert)?\b", txt, re.I) or
+        re.search(r"\bprivate\s+label\b", txt, re.I) or
+        re.search(r"\bpl\b", txt, re.I)
+    )
     return asin, buy, sell, roi, elig, bool(has_ip_pl)
 
 def compute_profit_roi(buy: Optional[float], sell: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
@@ -430,17 +467,28 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
     
     log.info(f"Trying {len(KEEPA_DOMAINS_TO_TRY)} Keepa domains for ASIN {asin}: {[domain_names.get(d, d) for d in KEEPA_DOMAINS_TO_TRY]}")
     
+    best_brand = None
+    best_title = None
+    best_domain_info = None
+
     for d in KEEPA_DOMAINS_TO_TRY:
         price, brand, title, note, used = await fetch_once(d)
         diags.append(note)
         if price is not None:
             log.info(f"✓ Found price on {domain_names.get(d, d)} domain: {price}")
-            return price, brand, title, " | ".join(diags), used
-        elif brand or title:
-            log.info(f"✓ Found product info on {domain_names.get(d, d)} domain (no price)")
-            return price, brand, title, " | ".join(diags), used
+            if brand and not best_brand:
+                best_brand = brand
+            if title and not best_title:
+                best_title = title
+            return price, (best_brand or brand), (best_title or title), " | ".join(diags), used
+        if (brand or title) and best_domain_info is None:
+            best_brand = brand or best_brand
+            best_title = title or best_title
+            best_domain_info = used
     
     log.warning(f"✗ No price found on any of {len(KEEPA_DOMAINS_TO_TRY)} domains")
+    if best_brand or best_title:
+        return None, best_brand, best_title, " | ".join(diags), best_domain_info
     return None, None, None, " | ".join(diags), None
 
 # ---------------- Decisions ----------------
