@@ -25,6 +25,7 @@
 # In Discord Developer Portal → Bot: enable "Message Content Intent".
 
 import os, re, json, asyncio, logging
+import urllib.parse
 from typing import Optional, Tuple, List, Dict
 
 import discord
@@ -439,18 +440,35 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
                 for key in ("buyBoxPrice", "buyBoxShipping", "newPrice", "amazonPrice"):
                     price = cents(current.get(key))
                     if price: break
-            # 3) CSV fallbacks
             if not price and isinstance(csv, dict):
-                def iter_series():
-                    for k, arr in csv.items():
-                        name = str(k).lower()
-                        if any(t in name for t in ("buy", "box", "amazon", "new")) and isinstance(arr, list):
-                            yield arr
-                for series in iter_series():
-                    for x in reversed(series):
-                        if isinstance(x, (int, float)) and x > 0:
-                            price = cents(x); break
-                    if price: break
+                def last_price_from_series(arr):
+                    val = None
+                    for x in reversed(arr):
+                        if isinstance(x, (int, float)) and 0 < x <= 500000:
+                            val = cents(x); break
+                    return val
+                preferred = []
+                for k, arr in csv.items():
+                    name = str(k).lower()
+                    if isinstance(arr, list) and any(t in name for t in ("buy", "box", "amazon", "new")):
+                        preferred.append(arr)
+                for series in preferred:
+                    price = last_price_from_series(series)
+                    if price:
+                        break
+                if not price:
+                    for arr in csv.values():
+                        if isinstance(arr, list):
+                            price = last_price_from_series(arr)
+                            if price:
+                                break
+
+            if not price:
+                top_level_candidates = [p.get("listPrice"), (current.get("listPrice") if isinstance(current, dict) else None)]
+                for v in top_level_candidates:
+                    price = cents(v)
+                    if price:
+                        break
 
             brand = (p.get("brand") or "").strip()
             title = (p.get("title") or "").strip()
@@ -603,7 +621,7 @@ async def handle_lead_message(message: discord.Message):
     # Build links (use domain used if we have it; else first candidate)
     amz_domain = domain_used if domain_used is not None else KEEPA_DOMAINS_TO_TRY[0]
     amz_url = amazon_url_for_domain(asin, amz_domain)
-    sas_url = f"https://sas.selleramp.com/sas/lookup?asin={asin}&sas_cost_price={(buy or 0):.2f}&source_url={amz_url.replace(':','%3A').replace('/','%2F')}"
+    sas_url = f"https://sas.selleramp.com/sas/lookup?asin={asin}&sas_cost_price={(buy or 0):.2f}&source_url={urllib.parse.quote(amz_url, safe='')}"
 
     # Build embed title with product info if available
     embed_title = keepa_title[:100] + "..." if keepa_title and len(keepa_title) > 100 else (keepa_title or f"ASIN: {asin}")
