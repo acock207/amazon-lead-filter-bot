@@ -44,6 +44,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 FORWARD_USER_ID = int(os.getenv("FORWARD_USER_ID", "0"))
+FORWARD_CHANNEL_ID = int(os.getenv("FORWARD_CHANNEL_ID", "0"))
 
 MIN_PROFIT = float(os.getenv("MIN_PROFIT", "5"))
 MIN_ROI = float(os.getenv("MIN_ROI", "8"))
@@ -265,9 +266,9 @@ def extract_from_text(txt: str):
                 asin = cand
                 log.info(f"✓ Found flexible B0 ASIN: {asin}")
 
-    mb = re.search(r"\b(Buy|Cost|Price)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
+    mb = re.search(r"\b(Buy|Cost)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
     if mb: buy = float(mb.group(2))
-    ms = re.search(r"\b(Sell|Sale|SP)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
+    ms = re.search(r"\b(Sell|Sale|SP|Price)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
     if ms: sell = float(ms.group(2))
 
     m = ROI_RE.search(txt)
@@ -723,11 +724,11 @@ async def handle_lead_message(message: discord.Message):
 
     # ROI field shows percent + (Sell, Buy)
     roi_str = pct(roi)
-    if buy and sell:
+    if buy is not None and sell is not None:
         roi_str += f"  (Sell {money(sell)}, Buy {money(buy)})"
-    elif not buy:
+    elif buy is None:
         roi_str += "  (Buy price missing)"
-    elif not sell:
+    elif sell is None:
         roi_str += "  (Sell price missing)"
     embed.add_field(name="ROI", value=roi_str, inline=False)
 
@@ -746,7 +747,10 @@ async def handle_lead_message(message: discord.Message):
         embed.set_footer(text=" • ".join(footer_parts))
 
     await message.reply(embed=embed, mention_author=False)
-    await try_dm(FORWARD_USER_ID, f"Lead from #{message.channel.name}", embed)
+    if ok:
+        sent = await try_dm(FORWARD_USER_ID, f"Lead from #{message.channel.name}", embed)
+        if not sent:
+            await try_send_channel(FORWARD_CHANNEL_ID, f"Lead from #{message.channel.name}", embed)
 
 # ---------------- Health Check Server (for Digital Ocean/cloud platforms) ----------------
 HEALTH_CHECK_PORT = int(os.getenv("PORT", "8080"))
@@ -909,11 +913,16 @@ async def diag_asin(interaction: discord.Interaction, asin: str):
     async with aiohttp.ClientSession() as session:
         sell, brand, title, diag, used = await product_fetch(session, asin)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
+    effective_buy = DEFAULT_BUY if DEFAULT_BUY > 0 else None
+    profit = roi = None
+    if effective_buy is not None and sell is not None:
+        profit, roi = compute_profit_roi(effective_buy, sell)
     await interaction.followup.send(
         f"ASIN: *{asin}*\n"
         f"Brand: {brand or '—'}\n"
         f"Title: {title or '—'}\n"
-        f"Sell: {money(sell)}\n"
+        f"Sell: {money(sell)} | Buy used: {money(effective_buy)}\n"
+        f"Profit: {money(profit)} | ROI: {pct(roi)}\n"
         f"Amazon: {amz_url}\n"
         f"Diag: {diag}",
         ephemeral=True
@@ -956,3 +965,13 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN missing in .env")
     bot.run(TOKEN)
+async def try_send_channel(channel_id: int, content: str = "", embed: Optional[discord.Embed] = None) -> bool:
+    if not channel_id: return False
+    try:
+        ch = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        if embed: await ch.send(content=content, embed=embed)
+        else:     await ch.send(content)
+        return True
+    except Exception as e:
+        log.info("Channel send failed: %s", e)
+        return False
