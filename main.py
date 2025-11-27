@@ -55,6 +55,7 @@ KEEPA_KEY = os.getenv("KEEPA_KEY")
 KEEPA_DOMAIN_RAW = (os.getenv("KEEPA_DOMAIN") or "GB").strip()
 
 OCRSPACE_KEY = (os.getenv("OCRSPACE_KEY") or "").strip()
+RAINFOREST_KEY = os.getenv("RAINFOREST_KEY")
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -509,6 +510,86 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
         return None, best_brand, best_title, " | ".join(diags), best_domain_info
     return None, None, None, " | ".join(diags), None
 
+async def rainforest_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Optional[float], Optional[str], Optional[str], str, Optional[int]]:
+    if not RAINFOREST_KEY:
+        return None, None, None, "Rainforest disabled: RAINFOREST_KEY not set.", None
+
+    def parse_price_obj(po):
+        if not isinstance(po, dict):
+            return None
+        v = po.get("value")
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+        raw = po.get("raw")
+        if isinstance(raw, str):
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", raw)
+            if m:
+                try:
+                    return float(m.group(1))
+                except:
+                    return None
+        return None
+
+    async def fetch_once(domain_id: int):
+        host = amazon_url_for_domain(asin, domain_id).split("/")[2]
+        domain = host.replace("www.", "")
+        url = "https://api.rainforestapi.com/request"
+        params = {"api_key": RAINFOREST_KEY, "type": "product", "asin": asin, "amazon_domain": domain}
+        try:
+            async with session.get(url, params=params, timeout=25) as r:
+                status = r.status
+                raw = await r.text()
+            try:
+                js = json.loads(raw)
+            except Exception:
+                return None, None, None, f"Invalid JSON domain={domain_id} status={status}: {raw[:200]}", None
+
+            p = js.get("product") if isinstance(js, dict) else None
+            if not isinstance(p, dict):
+                return None, None, None, f"No product key domain={domain_id}", None
+
+            brand = (p.get("brand") or "").strip()
+            title = (p.get("title") or "").strip()
+
+            price = None
+            bb = p.get("buybox_winner")
+            if bb and isinstance(bb, dict):
+                price = parse_price_obj(bb.get("price")) or price
+
+            if not price:
+                price = parse_price_obj(p.get("price")) or price
+
+            if not price:
+                prices = p.get("prices") or p.get("offers") or []
+                if isinstance(prices, list):
+                    for item in prices:
+                        if isinstance(item, dict):
+                            price = parse_price_obj(item.get("price"))
+                            if price:
+                                break
+
+            note = f"OK domain={domain_id} status={status}" if (price or brand or title) else f"No usable price domain={domain_id}"
+            return price, brand, title, note, domain_id
+        except asyncio.TimeoutError:
+            return None, None, None, f"Timeout domain={domain_id}", None
+        except Exception as e:
+            return None, None, None, f"Exception domain={domain_id}: {e}", None
+
+    diags = []
+    for d in KEEPA_DOMAINS_TO_TRY:
+        price, brand, title, note, used = await fetch_once(d)
+        diags.append(note)
+        if price is not None or (brand or title):
+            return price, brand, title, " | ".join(diags), used
+    return None, None, None, " | ".join(diags), None
+
+async def product_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Optional[float], Optional[str], Optional[str], str, Optional[int]]:
+    if RAINFOREST_KEY:
+        sp, b, t, d, u = await rainforest_fetch(session, asin)
+        if sp is not None or (b or t):
+            return sp, b, t, d, u
+    return await keepa_fetch(session, asin)
+
 # ---------------- Decisions ----------------
 def decide(eligibility: Optional[str], profit: Optional[float], roi: Optional[float], ip_pl: bool) -> Tuple[bool, str]:
     if ip_pl:
@@ -580,15 +661,15 @@ async def handle_lead_message(message: discord.Message):
     keepa_title = None
     keepa_sell = None
     
-    log.info(f"  Fetching Keepa data for {asin}...")
+    log.info(f"  Fetching product data for {asin}...")
     async with aiohttp.ClientSession() as session:
-        ks, brand, title, keepa_diag, domain_used = await keepa_fetch(session, asin)
+        ks, brand, title, keepa_diag, domain_used = await product_fetch(session, asin)
         keepa_sell = ks
         if brand:
             keepa_brand = brand
         if title:
             keepa_title = title
-        log.info(f"  Keepa result - Sell: {keepa_sell} | Brand: {keepa_brand} | Title: {keepa_title[:50] if keepa_title else None} | Domain: {domain_used}")
+        log.info(f"  Data result - Sell: {keepa_sell} | Brand: {keepa_brand} | Title: {keepa_title[:50] if keepa_title else None} | Domain: {domain_used}")
     
     # Use Keepa sell price if we don't have one from message
     if sell is None or sell <= 0:
@@ -785,14 +866,15 @@ async def settings_cmd(interaction: discord.Interaction):
         f"- Min Profit: {money(MIN_PROFIT)}\n"
         f"- Min ROI: {MIN_ROI:.2f}%\n"
         f"- Default Buy: {money(DEFAULT_BUY) if DEFAULT_BUY else '—'}\n"
-        f"*Keepa*\n"
-        f"- Domain input: {KEEPA_DOMAIN_RAW} → trying {KEEPA_DOMAINS_TO_TRY}\n"
-        f"- Key set: {'Yes' if bool(KEEPA_KEY) else 'No'}\n"
+        f"*Data Sources*\n"
+        f"- Rainforest key set: {'Yes' if bool(RAINFOREST_KEY) else 'No'}\n"
+        f"- Keepa domain input: {KEEPA_DOMAIN_RAW} → trying {KEEPA_DOMAINS_TO_TRY}\n"
+        f"- Keepa key set: {'Yes' if bool(KEEPA_KEY) else 'No'}\n"
         f"*Watch*\n"
         f"- Watch-all: {CFG.get('watch_all', False)}\n"
         f"- Watched: {watched if watched else '[]'}",
         ephemeral=True
-    )
+    )   
 
 @bot.tree.command(name="set_min_profit", description="Set minimum profit (£)")
 async def set_min_profit_cmd(interaction: discord.Interaction, value: float):
@@ -825,7 +907,7 @@ async def diag_asin(interaction: discord.Interaction, asin: str):
         await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     async with aiohttp.ClientSession() as session:
-        sell, brand, title, diag, used = await keepa_fetch(session, asin)
+        sell, brand, title, diag, used = await product_fetch(session, asin)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
     await interaction.followup.send(
         f"ASIN: *{asin}*\n"
@@ -845,7 +927,7 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     async with aiohttp.ClientSession() as session:
-        sell, brand, title, diag, used = await keepa_fetch(session, asin)
+        sell, brand, title, diag, used = await product_fetch(session, asin)
     effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else None)
     profit = roi = None
     if effective_buy is not None and sell is not None:
