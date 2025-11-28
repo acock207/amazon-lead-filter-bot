@@ -272,9 +272,9 @@ def extract_from_text(txt: str):
                 asin = cand
                 log.info(f"✓ Found flexible B0 ASIN: {asin}")
 
-    mb = re.search(r"\b(Buy|Cost)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
-    if mb: buy = float(mb.group(2))
-    ms = re.search(r"\b(Sell|Sale|SP|Price)\s*[:=]\s*£?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
+    mb = re.search(r"\b(?:Buy(?:ing)?(?:\s*Price)?|Cost(?:\s*Price)?|BP|CP|CPP|COGS)\b\s*[:=]?\s*(?:£|GBP)?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
+    if mb: buy = float(mb.group(1))
+    ms = re.search(r"\b(Sell|Sale|SP|Price)\s*[:=]\s*(?:£|GBP)?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
     if ms: sell = float(ms.group(2))
 
     m = ROI_RE.search(txt)
@@ -729,10 +729,20 @@ async def handle_lead_message(message: discord.Message):
         log.info(f"  Using Sell price from message: {sell} (Keepa had: {keepa_sell})")
 
     # Use DEFAULT_BUY if no Buy price in message
+    buy_inferred = False
     if buy is None:
         if DEFAULT_BUY > 0:
             buy = DEFAULT_BUY
             log.info(f"  Using DEFAULT_BUY from .env: {buy}")
+        elif roi is not None and sell is not None and sell > 0:
+            try:
+                inferred = round(sell / (1.0 + (roi / 100.0)), 2)
+                if inferred > 0:
+                    buy = inferred
+                    buy_inferred = True
+                    log.info(f"  Inferred Buy from ROI: {buy}")
+            except Exception:
+                pass
         else:
             log.warning(f"  No Buy price found in message AND DEFAULT_BUY is not set - ROI cannot be calculated")
 
@@ -787,8 +797,12 @@ async def handle_lead_message(message: discord.Message):
         footer_parts.append(f"Keepa: {keepa_diag}")
     if buy and DEFAULT_BUY > 0 and buy == DEFAULT_BUY:
         footer_parts.append("Buy from DEFAULT_BUY")
+    if buy_inferred:
+        footer_parts.append("Buy inferred from ROI")
     if sell and keepa_sell and sell == keepa_sell:
         footer_parts.append("Sell from Keepa")
+    if buy is not None and roi is not None and DEFAULT_BUY == 0 and "Inferred Buy" in " ":
+        pass
     if footer_parts:
         embed.set_footer(text=" • ".join(footer_parts))
 
