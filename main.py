@@ -42,7 +42,7 @@ log = logging.getLogger("bot")
 # ---------------- Env ----------------
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 FORWARD_USER_ID = int(os.getenv("FORWARD_USER_ID", "0"))
 FORWARD_CHANNEL_ID = int(os.getenv("FORWARD_CHANNEL_ID", "0"))
 
@@ -307,18 +307,21 @@ def compute_profit_roi(buy: Optional[float], sell: Optional[float]) -> Tuple[Opt
     roi = round((profit / buy) * 100.0, 2) if buy > 0 else None
     return profit, roi
 
-def pick_keepa_buy(kp_map: Optional[Dict[str, Optional[float]]], sell_val: Optional[float]) -> Optional[float]:
+def pick_keepa_buy(kp_map: Optional[Dict[str, Optional[float]]], sell_val: Optional[float]) -> Tuple[Optional[float], Optional[str]]:
     if not kp_map:
-        return None
-    amz = kp_map.get("amazon")
-    nw = kp_map.get("new")
-    bb = kp_map.get("buybox")
-    def diff(a, b):
-        return a is not None and (b is None or round(a, 2) != round(b, 2))
-    for v in (amz, nw, bb):
-        if diff(v, sell_val):
-            return v
-    return None
+        return None, None
+    # Collect all available Keepa prices
+    vals = []
+    if kp_map.get("amazon") is not None: vals.append((kp_map["amazon"], "Amazon"))
+    if kp_map.get("new") is not None: vals.append((kp_map["new"], "New"))
+    if kp_map.get("buybox") is not None: vals.append((kp_map["buybox"], "Buy Box"))
+    
+    if not vals:
+        return None, None
+    
+    # Return the lowest available price to simulate "Best Buy" cost
+    # We ignore sell_val to ensure Buy price is always shown if Keepa has data
+    return min(vals, key=lambda x: x[0])
 def profit_breakdown_text(buy: Optional[float], sell: Optional[float]) -> Optional[str]:
     if buy is None or sell is None:
         return None
@@ -908,24 +911,13 @@ async def handle_lead_message(message: discord.Message):
     buy_from_keepa = False
     buy_keepa_source = None
     if buy is None:
-        def neq(a, b):
-            return (a is not None and b is not None and round(a, 2) != round(b, 2)) or (a is not None and b is None)
-        if keepa_amz_cur and neq(keepa_amz_cur, sell):
-            buy = keepa_amz_cur
+        # Try to get buy price from Keepa (lowest available)
+        k_buy, k_source = pick_keepa_buy(kp, sell)
+        if k_buy is not None:
+            buy = k_buy
             buy_from_keepa = True
-            buy_keepa_source = "Amazon"
-            log.info(f"  Using Buy from Keepa Amazon: {buy}")
-        elif keepa_buybox_cur and neq(keepa_buybox_cur, sell):
-            buy = keepa_buybox_cur
-            buy_from_keepa = True
-            buy_keepa_source = "Buy Box"
-            log.info(f"  Using Buy from Keepa Buy Box: {buy}")
-        elif keepa_new_cur and neq(keepa_new_cur, sell):
-            buy = keepa_new_cur
-            buy_from_keepa = True
-            buy_keepa_source = "New"
-            log.info(f"  Using Buy from Keepa New: {buy}")
-        # Avoid Buy == Sell; prefer a Keepa value that differs
+            buy_keepa_source = k_source
+            log.info(f"  Using Buy from Keepa ({k_source}): {buy}")
         elif DEFAULT_BUY > 0:
             buy = DEFAULT_BUY
             log.info(f"  Using DEFAULT_BUY from .env: {buy}")
@@ -1193,11 +1185,13 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         if sell is None and kp:
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
-    effective_buy = buy if buy is not None else (
-        pick_keepa_buy(kp, sell) if kp else (
-            DEFAULT_BUY if DEFAULT_BUY > 0 else None
-        )
-    )
+    # Determine effective buy price
+    effective_buy = buy
+    if effective_buy is None and kp:
+        k_val, _ = pick_keepa_buy(kp, sell)
+        effective_buy = k_val
+    if effective_buy is None and DEFAULT_BUY > 0:
+        effective_buy = DEFAULT_BUY
     
     profit = roi = None
     if effective_buy is not None and sell is not None:
@@ -1231,11 +1225,13 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         kp = await keepa_current_prices(session, asin)
         if sell is None and kp:
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
-    effective_buy = buy if buy is not None else (
-        pick_keepa_buy(kp, sell) if kp else (
-            DEFAULT_BUY if DEFAULT_BUY > 0 else None
-        )
-    )
+    # Determine effective buy price
+    effective_buy = buy
+    if effective_buy is None and kp:
+        k_val, _ = pick_keepa_buy(kp, sell)
+        effective_buy = k_val
+    if effective_buy is None and DEFAULT_BUY > 0:
+        effective_buy = DEFAULT_BUY
 
 def parse_message_url(url: str) -> Optional[Tuple[int, int]]:
     try:
@@ -1274,8 +1270,9 @@ async def diag_msg(interaction: discord.Interaction, link: str):
         kp = await keepa_current_prices(session, asin)
     if sell is None:
         sell = (keepa_sell or (kp.get("buybox") or kp.get("amazon") or kp.get("new") if kp else None))
-    if buy is None:
-        buy = (pick_keepa_buy(kp, sell) if kp else None)
+    if buy is None and kp:
+        k_val, _ = pick_keepa_buy(kp, sell)
+        buy = k_val
     profit, roi_calc = compute_profit_roi(buy, sell)
     if roi is None: roi = roi_calc
     amz_url = amazon_url_for_domain(asin, domain_used if domain_used is not None else KEEPA_DOMAINS_TO_TRY[0])
