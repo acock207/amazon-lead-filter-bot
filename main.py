@@ -1135,3 +1135,4 @@ async def try_send_channel(channel_id: int, content: str = "", embed: Optional[d
     except Exception as e:
         log.info("Channel send failed: %s", e)
         return False
+
