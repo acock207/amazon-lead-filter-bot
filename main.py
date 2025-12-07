@@ -317,11 +317,11 @@ def pick_keepa_buy(kp_map: Optional[Dict[str, Optional[float]]], sell_val: Optio
         return a is not None and (b is None or round(a, 2) != round(b, 2))
     if diff(amz, sell_val):
         return amz
-    if diff(bb, sell_val):
-        return bb
     if diff(nw, sell_val):
         return nw
-    return None
+    if diff(bb, sell_val):
+        return bb
+    return amz or nw or bb
 def profit_breakdown_text(buy: Optional[float], sell: Optional[float]) -> Optional[str]:
     if buy is None or sell is None:
         return None
@@ -945,9 +945,7 @@ async def handle_lead_message(message: discord.Message):
             log.warning(f"  No Buy price found in message AND DEFAULT_BUY is not set - ROI cannot be calculated")
 
     # Final guard: avoid Buy == Sell (non-informative)
-    if buy is not None and sell is not None and round(buy, 2) == round(sell, 2):
-        log.info("  Suppressing Buy because it equals Sell; set to None")
-        buy = None
+    
     # Calculate profit and ROI from Buy + Sell
     profit, roi_calc = compute_profit_roi(buy, sell)
     if roi is None:
@@ -1203,8 +1201,7 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
         )
     )
-    if effective_buy is not None and sell is not None and round(effective_buy, 2) == round(sell, 2):
-        effective_buy = None
+    
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
@@ -1242,8 +1239,7 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
         )
     )
-    if effective_buy is not None and sell is not None and round(effective_buy, 2) == round(sell, 2):
-        effective_buy = None
+    
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
