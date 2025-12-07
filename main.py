@@ -399,7 +399,7 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
 
     async def fetch_once(domain: int):
         url = "https://api.keepa.com/product"
-        params = {"key": KEEPA_KEY, "domain": domain, "asin": asin, "history": 1, "stats": 90}
+        params = {"key": KEEPA_KEY, "domain": domain, "asin": asin, "history": 1, "stats": 90, "offers": 20}
         try:
             async with session.get(url, params=params, timeout=25) as r:
                 status = r.status
@@ -435,8 +435,7 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
             current = stats.get("current") if isinstance(stats, dict) else None
             if not isinstance(current, dict): current = {}
 
-            csv = p.get("csv") or {}
-            if isinstance(csv, list): csv = {}
+            csv_raw = p.get("csv") or None
 
             price = None
             # 1) stats.*
@@ -448,7 +447,7 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
                 for key in ("buyBoxPrice", "buyBoxShipping", "newPrice", "amazonPrice"):
                     price = cents(current.get(key))
                     if price: break
-            if not price and isinstance(csv, dict):
+            if not price and isinstance(csv_raw, (list, dict)):
                 def last_price_from_series(arr):
                     if not isinstance(arr, list) or not arr:
                         return None
@@ -461,22 +460,46 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
                         if isinstance(x, (int, float)) and 0 < x <= 500000:
                             return cents(x)
                     return None
+                if isinstance(csv_raw, dict):
+                    series_iter = list(csv_raw.values())
+                else:
+                    series_iter = [a for a in csv_raw if isinstance(a, list)]
+                # Prefer series that likely represent buy box / amazon / new
                 preferred = []
-                for k, arr in csv.items():
-                    name = str(k).lower()
-                    if isinstance(arr, list) and any(t in name for t in ("buy", "box", "bb", "amazon", "new")):
-                        preferred.append(arr)
-                for series in preferred:
+                if isinstance(csv_raw, dict):
+                    for k, arr in csv_raw.items():
+                        name = str(k).lower()
+                        if isinstance(arr, list) and any(t in name for t in ("buy", "box", "bb", "amazon", "new")):
+                            preferred.append(arr)
+                for series in (preferred or series_iter):
                     p2 = last_price_from_series(series)
                     if p2:
                         price = p2
                         break
-                if not price:
-                    for arr in csv.values():
-                        p2 = last_price_from_series(arr)
-                        if p2:
-                            price = p2
-                            break
+
+            if not price:
+                offers = p.get("offers") or []
+                def last_offer_price(ocsv):
+                    if not isinstance(ocsv, list):
+                        return None
+                    # Find last plausible price (cents) within the mixed CSV payload
+                    for i in range(len(ocsv) - 1, -1, -1):
+                        x = ocsv[i]
+                        if isinstance(x, (int, float)) and 0 < x <= 500000:
+                            return cents(x)
+                    return None
+                cand = []
+                for off in offers:
+                    ocsv = (off or {}).get("offerCSV")
+                    p2 = last_offer_price(ocsv)
+                    if p2:
+                        # include shipping if available
+                        ship = (off or {}).get("shipping")
+                        if isinstance(ship, (int, float)) and ship > 0:
+                            p2 = round(p2 + ship/100.0, 2)
+                        cand.append(p2)
+                if cand:
+                    price = min(cand)
 
             if not price:
                 top_level_candidates = [p.get("listPrice"), (current.get("listPrice") if isinstance(current, dict) else None)]
@@ -531,7 +554,7 @@ async def keepa_current_prices(session: aiohttp.ClientSession, asin: str) -> Dic
         return round(v / 100.0, 2) if isinstance(v, (int, float)) and v > 0 else None
     async def fetch_once(domain: int):
         url = "https://api.keepa.com/product"
-        params = {"key": KEEPA_KEY, "domain": domain, "asin": asin, "history": 1, "stats": 90}
+        params = {"key": KEEPA_KEY, "domain": domain, "asin": asin, "history": 1, "stats": 90, "offers": 20}
         try:
             async with session.get(url, params=params, timeout=25) as r:
                 raw = await r.text()
@@ -557,8 +580,7 @@ async def keepa_current_prices(session: aiohttp.ClientSession, asin: str) -> Dic
             newp = cents(stats.get("newPrice")) or cents(current.get("newPrice"))
             amazp = cents(stats.get("amazonPrice")) or cents(current.get("amazonPrice"))
             if not (buybox or newp or amazp):
-                csv = p.get("csv") or {}
-                if isinstance(csv, list): csv = {}
+                csv = p.get("csv") or None
                 def last_price_from_series(arr):
                     if not isinstance(arr, list) or not arr:
                         return None
@@ -583,8 +605,37 @@ async def keepa_current_prices(session: aiohttp.ClientSession, asin: str) -> Dic
                         if amazp is None and "amazon" in name:
                             p2 = last_price_from_series(arr)
                             if p2: amazp = p2
+                elif isinstance(csv, list):
+                    for arr in csv:
+                        p2 = last_price_from_series(arr)
+                        if p2:
+                            if buybox is None:
+                                buybox = p2
+                            elif newp is None:
+                                newp = p2
+                            elif amazp is None:
+                                amazp = p2
             if buybox or newp or amazp:
                 return {"buybox": buybox, "new": newp, "amazon": amazp, "domain": domain}
+            offers = p.get("offers") or []
+            if offers:
+                def last_offer_price(ocsv):
+                    if not isinstance(ocsv, list):
+                        return None
+                    for i in range(len(ocsv) - 1, -1, -1):
+                        x = ocsv[i]
+                        if isinstance(x, (int, float)) and 0 < x <= 500000:
+                            return cents(x)
+                    return None
+                cand = []
+                for off in offers:
+                    ocsv = (off or {}).get("offerCSV")
+                    p2 = last_offer_price(ocsv)
+                    if p2:
+                        cand.append(p2)
+                if cand:
+                    bb = min(cand)
+                    return {"buybox": bb, "new": newp, "amazon": amazp, "domain": domain}
             return {}
         except Exception:
             return {}
@@ -1135,4 +1186,3 @@ async def try_send_channel(channel_id: int, content: str = "", embed: Optional[d
     except Exception as e:
         log.info("Channel send failed: %s", e)
         return False
-
