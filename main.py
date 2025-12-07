@@ -756,12 +756,20 @@ async def handle_lead_message(message: discord.Message):
         if title:
             keepa_title = title
         log.info(f"  Data result - Sell: {keepa_sell} | Brand: {keepa_brand} | Title: {keepa_title[:50] if keepa_title else None} | Domain: {domain_used}")
+        kp = await keepa_current_prices(session, asin)
+        keepa_buybox_cur = kp.get("buybox") if kp else None
+        keepa_new_cur = kp.get("new") if kp else None
+        keepa_amz_cur = kp.get("amazon") if kp else None
     
     # Use Keepa sell price if we don't have one from message
     if sell is None or sell <= 0:
+        fallback_cur = keepa_buybox_cur or keepa_amz_cur or keepa_new_cur
         if keepa_sell:
             sell = keepa_sell
             log.info(f"  Using Sell price from Keepa: {sell}")
+        elif fallback_cur:
+            sell = fallback_cur
+            log.info(f"  Using Sell price from Keepa current: {sell}")
         else:
             log.warning(f"  No Sell price found in message OR Keepa")
     else:
@@ -827,16 +835,9 @@ async def handle_lead_message(message: discord.Message):
         roi_str += "  (Sell price missing)"
     embed.add_field(name="ROI", value=roi_str, inline=False)
 
-    keepa_buybox = keepa_new = keepa_amazon = None
-    try:
-        async with aiohttp.ClientSession() as session:
-            kp = await keepa_current_prices(session, asin)
-        if kp:
-            keepa_buybox = kp.get("buybox")
-            keepa_new = kp.get("new")
-            keepa_amazon = kp.get("amazon")
-    except Exception:
-        pass
+    keepa_buybox = keepa_buybox_cur
+    keepa_new = keepa_new_cur
+    keepa_amazon = keepa_amz_cur
     embed.add_field(
         name="Keepa Current",
         value=f"Buy Box {money(keepa_buybox)} • New {money(keepa_new)} • Amazon {money(keepa_amazon)}",
@@ -1029,6 +1030,9 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
     async with aiohttp.ClientSession() as session:
         sell, brand, title, diag, used = await product_fetch(session, asin)
         kp = await keepa_current_prices(session, asin)
+        if sell is None and kp:
+            sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
+        kp = await keepa_current_prices(session, asin)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
     effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else None)
     profit = roi = None
@@ -1058,6 +1062,9 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
     await interaction.response.defer(ephemeral=False)
     async with aiohttp.ClientSession() as session:
         sell, brand, title, diag, used = await product_fetch(session, asin)
+        kp = await keepa_current_prices(session, asin)
+        if sell is None and kp:
+            sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
         kp = await keepa_current_prices(session, asin)
     effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else None)
     profit = roi = None
