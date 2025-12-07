@@ -307,6 +307,21 @@ def compute_profit_roi(buy: Optional[float], sell: Optional[float]) -> Tuple[Opt
     roi = round((profit / buy) * 100.0, 2) if buy > 0 else None
     return profit, roi
 
+def pick_keepa_buy(kp_map: Optional[Dict[str, Optional[float]]], sell_val: Optional[float]) -> Optional[float]:
+    if not kp_map:
+        return None
+    amz = kp_map.get("amazon")
+    bb = kp_map.get("buybox")
+    nw = kp_map.get("new")
+    def diff(a, b):
+        return a is not None and (b is None or round(a, 2) != round(b, 2))
+    if diff(amz, sell_val):
+        return amz
+    if diff(bb, sell_val):
+        return bb
+    if diff(nw, sell_val):
+        return nw
+    return None
 def profit_breakdown_text(buy: Optional[float], sell: Optional[float]) -> Optional[str]:
     if buy is None or sell is None:
         return None
@@ -1165,23 +1180,7 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         kp = await keepa_current_prices(session, asin)
         if sell is None and kp:
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
-        kp = await keepa_current_prices(session, asin)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
-    def pick_keepa_buy(kp_map, sell_val):
-        if not kp_map:
-            return None
-        amz = kp_map.get("amazon")
-        bb = kp_map.get("buybox")
-        nw = kp_map.get("new")
-        def neq(a, b):
-            return (a is not None and b is not None and round(a, 2) != round(b, 2)) or (a is not None and b is None)
-        if amz and neq(amz, sell_val):
-            return amz
-        if bb and neq(bb, sell_val):
-            return bb
-        if nw and neq(nw, sell_val):
-            return nw
-        return amz or bb or nw
     effective_buy = buy if buy is not None else (
         pick_keepa_buy(kp, sell) if kp else (
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
@@ -1219,7 +1218,6 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         kp = await keepa_current_prices(session, asin)
         if sell is None and kp:
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
-        kp = await keepa_current_prices(session, asin)
     effective_buy = buy if buy is not None else (
         pick_keepa_buy(kp, sell) if kp else (
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
