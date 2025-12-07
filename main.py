@@ -556,6 +556,33 @@ async def keepa_current_prices(session: aiohttp.ClientSession, asin: str) -> Dic
                 buybox = buybox or cents(stats.get(k)) or cents(current.get(k))
             newp = cents(stats.get("newPrice")) or cents(current.get("newPrice"))
             amazp = cents(stats.get("amazonPrice")) or cents(current.get("amazonPrice"))
+            if not (buybox or newp or amazp):
+                csv = p.get("csv") or {}
+                if isinstance(csv, list): csv = {}
+                def last_price_from_series(arr):
+                    if not isinstance(arr, list) or not arr:
+                        return None
+                    if isinstance(arr[-1], (int, float)):
+                        v = arr[-1]
+                        if 0 < v <= 500000:
+                            return cents(v)
+                    for i in range(len(arr) - 1, -1, -2):
+                        x = arr[i]
+                        if isinstance(x, (int, float)) and 0 < x <= 500000:
+                            return cents(x)
+                    return None
+                if isinstance(csv, dict):
+                    for k, arr in csv.items():
+                        name = str(k).lower()
+                        if buybox is None and any(t in name for t in ("buy", "box", "bb")):
+                            p2 = last_price_from_series(arr)
+                            if p2: buybox = p2
+                        if newp is None and "new" in name:
+                            p2 = last_price_from_series(arr)
+                            if p2: newp = p2
+                        if amazp is None and "amazon" in name:
+                            p2 = last_price_from_series(arr)
+                            if p2: amazp = p2
             if buybox or newp or amazp:
                 return {"buybox": buybox, "new": newp, "amazon": amazp, "domain": domain}
             return {}
