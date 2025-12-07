@@ -1239,6 +1239,65 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
         )
     )
+
+def parse_message_url(url: str) -> Optional[Tuple[int, int]]:
+    try:
+        m = re.search(r"/channels/\d+/(\d+)/(\d+)$", url)
+        if not m:
+            return None
+        return int(m.group(1)), int(m.group(2))
+    except Exception:
+        return None
+
+@bot.tree.command(name="diag_msg", description="Diagnose a lead from a Discord message link (parses Buy/Sell/ROI)")
+@app_commands.describe(link="Discord message link")
+async def diag_msg(interaction: discord.Interaction, link: str):
+    ids = parse_message_url(link.strip())
+    if not ids:
+        await interaction.response.send_message("Provide a valid Discord message link.", ephemeral=False); return
+    ch_id, msg_id = ids
+    await interaction.response.defer(ephemeral=False)
+    ch = interaction.client.get_channel(ch_id)
+    if ch is None:
+        ch = await interaction.client.fetch_channel(ch_id)
+    msg = await ch.fetch_message(msg_id)
+    txt = message_to_plaintext(msg)
+    asin, buy, sell, roi, elig, ip_pl = extract_from_text(txt)
+    if not asin or not is_valid_asin(asin):
+        await interaction.followup.send("No valid ASIN found in the message.", ephemeral=False); return
+    domain_used = None
+    keepa_brand = None
+    keepa_title = None
+    keepa_sell = None
+    async with aiohttp.ClientSession() as session:
+        ks, brand, title, keepa_diag, domain_used = await product_fetch(session, asin)
+        keepa_sell = ks
+        if brand: keepa_brand = brand
+        if title: keepa_title = title
+        kp = await keepa_current_prices(session, asin)
+    if sell is None:
+        sell = (keepa_sell or (kp.get("buybox") or kp.get("amazon") or kp.get("new") if kp else None))
+    if buy is None:
+        buy = (pick_keepa_buy(kp, sell) if kp else None)
+    profit, roi_calc = compute_profit_roi(buy, sell)
+    if roi is None: roi = roi_calc
+    amz_url = amazon_url_for_domain(asin, domain_used if domain_used is not None else KEEPA_DOMAINS_TO_TRY[0])
+    kb = money(kp.get("buybox")) if kp else "—"
+    kn = money(kp.get("new")) if kp else "—"
+    ka = money(kp.get("amazon")) if kp else "—"
+    calc_text = profit_breakdown_text(buy, sell)
+    await interaction.followup.send(
+        f"ASIN: *{asin}*\n"
+        f"Brand: {keepa_brand or '—'}\n"
+        f"Title: {keepa_title or '—'}\n"
+        f"Sell: {money(sell)} | Buy: {money(buy)}\n"
+        f"Keepa Current: Buy Box {kb} | New {kn} | Amazon {ka}\n"
+        f"Profit: {money(profit)} | ROI: {pct(roi)}\n"
+        f"Calc: {calc_text or '—'}\n"
+        f"Amazon: {amz_url}\n"
+        f"Diag: {keepa_diag}",
+        ephemeral=False
+    )
     
     profit = roi = None
     if effective_buy is not None and sell is not None:
