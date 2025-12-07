@@ -272,10 +272,10 @@ def extract_from_text(txt: str):
                 asin = cand
                 log.info(f"✓ Found flexible B0 ASIN: {asin}")
 
-    mb = re.search(r"\b(?:Buy(?:ing)?(?:\s*Price)?|Cost(?:\s*Price)?|BP|CP|CPP|COGS)\b\s*[:=]?\s*(?:£|GBP)?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
+    mb = re.search(r"\b(?:Buy(?:ing)?(?:\s*Price)?|Cost(?:\s*Price)?|BP|CP|CPP|COGS)\b\s*[:=\-]?\s*(?:£|GBP)?\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)", txt, re.I)
     if mb: buy = float(mb.group(1))
-    ms = re.search(r"\b(Sell|Sale|SP|Price)\s*[:=]\s*(?:£|GBP)?\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
-    if ms: sell = float(ms.group(2))
+    ms = re.search(r"\b(?:Sell|Sale|SP|Price|Selling(?:\s*Price)?)\b\s*[:=\-]?\s*(?:£|GBP)?\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?)", txt, re.I)
+    if ms: sell = float(ms.group(1))
 
     m = ROI_RE.search(txt)
     if m: roi = float(m.group(1))
@@ -524,6 +524,49 @@ async def keepa_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Option
         return None, best_brand, best_title, " | ".join(diags), best_domain_info
     return None, None, None, " | ".join(diags), None
 
+async def keepa_current_prices(session: aiohttp.ClientSession, asin: str) -> Dict[str, Optional[float]]:
+    if not KEEPA_KEY:
+        return {}
+    def cents(v):
+        return round(v / 100.0, 2) if isinstance(v, (int, float)) and v > 0 else None
+    async def fetch_once(domain: int):
+        url = "https://api.keepa.com/product"
+        params = {"key": KEEPA_KEY, "domain": domain, "asin": asin, "history": 1, "stats": 90}
+        try:
+            async with session.get(url, params=params, timeout=25) as r:
+                raw = await r.text()
+            js = json.loads(raw)
+            while isinstance(js, list) and js:
+                js = js[0]
+            products = js.get("products") if isinstance(js, dict) else None
+            if isinstance(products, list):
+                if not products:
+                    return {}
+                p = products[0]
+            elif isinstance(products, dict):
+                p = products
+            else:
+                return {}
+            stats = p.get("stats") or {}
+            if isinstance(stats, list): stats = {}
+            current = stats.get("current") if isinstance(stats, dict) else None
+            if not isinstance(current, dict): current = {}
+            buybox = None
+            for k in ("buyBoxPrice", "buyBoxShipping"):
+                buybox = buybox or cents(stats.get(k)) or cents(current.get(k))
+            newp = cents(stats.get("newPrice")) or cents(current.get("newPrice"))
+            amazp = cents(stats.get("amazonPrice")) or cents(current.get("amazonPrice"))
+            if buybox or newp or amazp:
+                return {"buybox": buybox, "new": newp, "amazon": amazp, "domain": domain}
+            return {}
+        except Exception:
+            return {}
+    for d in KEEPA_DOMAINS_TO_TRY:
+        r = await fetch_once(d)
+        if r:
+            return r
+    return {}
+
 async def rainforest_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Optional[float], Optional[str], Optional[str], str, Optional[int]]:
     if not RAINFOREST_KEY:
         return None, None, None, "Rainforest disabled: RAINFOREST_KEY not set.", None
@@ -631,10 +674,6 @@ async def rainforest_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[O
     return None, None, None, " | ".join(diags), None
 
 async def product_fetch(session: aiohttp.ClientSession, asin: str) -> Tuple[Optional[float], Optional[str], Optional[str], str, Optional[int]]:
-    if RAINFOREST_KEY:
-        sp, b, t, d, u = await rainforest_fetch(session, asin)
-        if sp is not None or (b or t):
-            return sp, b, t, d, u
     return await keepa_fetch(session, asin)
 
 # ---------------- Decisions ----------------
@@ -788,6 +827,22 @@ async def handle_lead_message(message: discord.Message):
         roi_str += "  (Sell price missing)"
     embed.add_field(name="ROI", value=roi_str, inline=False)
 
+    keepa_buybox = keepa_new = keepa_amazon = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            kp = await keepa_current_prices(session, asin)
+        if kp:
+            keepa_buybox = kp.get("buybox")
+            keepa_new = kp.get("new")
+            keepa_amazon = kp.get("amazon")
+    except Exception:
+        pass
+    embed.add_field(
+        name="Keepa Current",
+        value=f"Buy Box {money(keepa_buybox)} • New {money(keepa_new)} • Amazon {money(keepa_amazon)}",
+        inline=False,
+    )
+
     embed.add_field(name="Eligibility", value=(elig or "Unknown"), inline=True)
     embed.add_field(name="Links", value=f"[Amazon]({amz_url}) • [SAS]({sas_url})", inline=False)
     
@@ -874,7 +929,7 @@ async def watch_add(interaction: discord.Interaction, channel: Optional[discord.
     watched.add(ch.id)
     CFG["watched_channels"] = list(watched)
     save_config(CFG)
-    await interaction.response.send_message(f"Now watching <#{ch.id}>.", ephemeral=True)
+    await interaction.response.send_message(f"Now watching <#{ch.id}>.", ephemeral=False)
 
 @bot.tree.command(name="watch_remove", description="Stop watching a channel")
 async def watch_remove(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -882,7 +937,7 @@ async def watch_remove(interaction: discord.Interaction, channel: discord.TextCh
     watched.discard(channel.id)
     CFG["watched_channels"] = list(watched)
     save_config(CFG)
-    await interaction.response.send_message(f"Stopped watching <#{channel.id}>.", ephemeral=True)
+    await interaction.response.send_message(f"Stopped watching <#{channel.id}>.", ephemeral=False)
 
 @bot.tree.command(name="watch_list", description="List watched channels")
 async def watch_list(interaction: discord.Interaction):
@@ -898,13 +953,13 @@ async def watch_list(interaction: discord.Interaction):
             c = interaction.client.get_channel(cid)
             names.append(f"<#{cid}>" if c else str(cid))
         txt = "Watching: " + ", ".join(names)
-    await interaction.response.send_message(txt, ephemeral=True)
+    await interaction.response.send_message(txt, ephemeral=False)
 
 @bot.tree.command(name="watch_all", description="Toggle watching ALL channels (on/off)")
 async def watch_all(interaction: discord.Interaction, on: bool):
     CFG["watch_all"] = bool(on)
     save_config(CFG)
-    await interaction.response.send_message(f"Watch-all set to *{CFG['watch_all']}*.", ephemeral=True)
+    await interaction.response.send_message(f"Watch-all set to *{CFG['watch_all']}*.", ephemeral=False)
 
 @bot.tree.command(name="watch_add_all", description="Add ALL text channels in this server to the watch list")
 async def watch_add_all(interaction: discord.Interaction):
@@ -913,13 +968,13 @@ async def watch_add_all(interaction: discord.Interaction):
         watched.add(ch.id)
     CFG["watched_channels"] = list(watched)
     save_config(CFG)
-    await interaction.response.send_message(f"Added *{len(interaction.guild.text_channels)}* channels to watch list.", ephemeral=True)
+    await interaction.response.send_message(f"Added *{len(interaction.guild.text_channels)}* channels to watch list.", ephemeral=False)
 
 @bot.tree.command(name="watch_clear", description="Clear the watched channel list (keeps watch-all setting)")
 async def watch_clear(interaction: discord.Interaction):
     CFG["watched_channels"] = []
     save_config(CFG)
-    await interaction.response.send_message("Cleared watched channels.", ephemeral=True)
+    await interaction.response.send_message("Cleared watched channels.", ephemeral=False)
 
 @bot.tree.command(name="settings", description="Show current filter & watch settings")
 async def settings_cmd(interaction: discord.Interaction):
@@ -931,62 +986,67 @@ async def settings_cmd(interaction: discord.Interaction):
         f"- Min ROI: {MIN_ROI:.2f}%\n"
         f"- Default Buy: {money(DEFAULT_BUY) if DEFAULT_BUY else '—'}\n"
         f"*Data Sources*\n"
-        f"- Rainforest key set: {'Yes' if bool(RAINFOREST_KEY) else 'No'}\n"
+        f"- Rainforest: Disabled (Keepa-only)\n"
         f"- Keepa domain input: {KEEPA_DOMAIN_RAW} → trying {KEEPA_DOMAINS_TO_TRY}\n"
         f"- Keepa key set: {'Yes' if bool(KEEPA_KEY) else 'No'}\n"
         f"*Watch*\n"
         f"- Watch-all: {CFG.get('watch_all', False)}\n"
         f"- Watched: {watched if watched else '[]'}",
-        ephemeral=True
+        ephemeral=False
     )   
 
 @bot.tree.command(name="set_min_profit", description="Set minimum profit (£)")
 async def set_min_profit_cmd(interaction: discord.Interaction, value: float):
     global MIN_PROFIT
     MIN_PROFIT = float(value)
-    await interaction.response.send_message(f"Min profit set to {money(MIN_PROFIT)}", ephemeral=True)
+    await interaction.response.send_message(f"Min profit set to {money(MIN_PROFIT)}", ephemeral=False)
 
 @bot.tree.command(name="set_min_roi", description="Set minimum ROI (%)")
 async def set_min_roi_cmd(interaction: discord.Interaction, value: float):
     global MIN_ROI
     MIN_ROI = float(value)
-    await interaction.response.send_message(f"Min ROI set to {MIN_ROI:.2f}%", ephemeral=True)
+    await interaction.response.send_message(f"Min ROI set to {MIN_ROI:.2f}%", ephemeral=False)
 
 @bot.tree.command(name="set_default_buy", description="Set default buy price for ASIN-only leads")
 async def set_default_buy_cmd(interaction: discord.Interaction, value: float):
     global DEFAULT_BUY
     DEFAULT_BUY = float(value)
-    await interaction.response.send_message(f"Default buy set to {money(DEFAULT_BUY)}", ephemeral=True)
+    await interaction.response.send_message(f"Default buy set to {money(DEFAULT_BUY)}", ephemeral=False)
 
 @bot.tree.command(name="set_allow_unknown_elig", description="Allow or block unknown eligibility")
 async def set_allow_unknown_elig_cmd(interaction: discord.Interaction, allow: bool):
     global ALLOW_UNKNOWN_ELIG
     ALLOW_UNKNOWN_ELIG = bool(allow)
-    await interaction.response.send_message(f"Allow unknown eligibility: {ALLOW_UNKNOWN_ELIG}", ephemeral=True)
+    await interaction.response.send_message(f"Allow unknown eligibility: {ALLOW_UNKNOWN_ELIG}", ephemeral=False)
 
 @bot.tree.command(name="diag_asin", description="Check product price/brand/title and show diagnostics")
 @app_commands.describe(asin="10-char ASIN", buy="Override buy price (optional)")
 async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[float] = None):
     asin = asin.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-        await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=False); return
+    await interaction.response.defer(ephemeral=False)
     async with aiohttp.ClientSession() as session:
         sell, brand, title, diag, used = await product_fetch(session, asin)
+        kp = await keepa_current_prices(session, asin)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
     effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else None)
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
+    kb = money(kp.get("buybox")) if kp else "—"
+    kn = money(kp.get("new")) if kp else "—"
+    ka = money(kp.get("amazon")) if kp else "—"
     await interaction.followup.send(
         f"ASIN: *{asin}*\n"
         f"Brand: {brand or '—'}\n"
         f"Title: {title or '—'}\n"
         f"Sell: {money(sell)} | Buy: {money(effective_buy)}\n"
+        f"Keepa Current: Buy Box {kb} | New {kn} | Amazon {ka}\n"
         f"Profit: {money(profit)} | ROI: {pct(roi)}\n"
         f"Amazon: {amz_url}\n"
         f"Diag: {diag}",
-        ephemeral=True
+        ephemeral=False
     )
 
 @bot.tree.command(name="calc_asin", description="Fetch Keepa price and compute ROI/Profit (uses default buy unless provided)")
@@ -994,24 +1054,29 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
 async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[float] = None):
     asin = asin.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{10}", asin):
-        await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=True); return
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Provide a valid 10-character ASIN.", ephemeral=False); return
+    await interaction.response.defer(ephemeral=False)
     async with aiohttp.ClientSession() as session:
         sell, brand, title, diag, used = await product_fetch(session, asin)
+        kp = await keepa_current_prices(session, asin)
     effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else None)
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
+    kb = money(kp.get("buybox")) if kp else "—"
+    kn = money(kp.get("new")) if kp else "—"
+    ka = money(kp.get("amazon")) if kp else "—"
     await interaction.followup.send(
         f"ASIN: *{asin}*\n"
         f"Brand: {brand or '—'}\n"
         f"Title: {title or '—'}\n"
         f"Sell: {money(sell)} | Buy used: {money(effective_buy)}\n"
+        f"Keepa Current: Buy Box {kb} | New {kn} | Amazon {ka}\n"
         f"Profit: {money(profit)} | ROI: {pct(roi)}\n"
         f"Amazon: {amz_url}\n"
         f"Diag: {diag}",
-        ephemeral=True
+        ephemeral=False
     )
 
 # ------------- Context menu: Show Plain Text (right-click a message → Apps) -----
@@ -1019,7 +1084,7 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
 async def show_plain_ctx(interaction: discord.Interaction, message: discord.Message):
     txt = message_to_plaintext(message)
     preview = txt if len(txt) <= 1800 else txt[:1800] + "\n…(truncated)…"
-    await interaction.response.send_message(f"text\n{preview}\n", ephemeral=True)
+    await interaction.response.send_message(f"text\n{preview}\n", ephemeral=False)
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
