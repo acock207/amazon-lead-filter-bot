@@ -64,6 +64,11 @@ RAINFOREST_SHOW_DIFFERENT_ASINS = os.getenv("RAINFOREST_SHOW_DIFFERENT_ASINS", "
 RAINFOREST_MIN_PRICE = os.getenv("RAINFOREST_MIN_PRICE")
 RAINFOREST_MAX_PRICE = os.getenv("RAINFOREST_MAX_PRICE")
 
+# Profit/ROI fee assumptions (can be adjusted via environment)
+REFERRAL_FEE_PCT = float(os.getenv("REFERRAL_FEE_PCT", "15"))
+FBA_FEE = float(os.getenv("FBA_FEE", "0"))
+VAT_PCT = float(os.getenv("VAT_PCT", "0"))
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 # ---------------- Config persistence ----------------
@@ -292,7 +297,13 @@ def extract_from_text(txt: str):
 def compute_profit_roi(buy: Optional[float], sell: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
     if buy is None or sell is None:
         return None, None
-    profit = round(sell - buy, 2)
+    # Apply VAT if configured (reduces net revenue)
+    sell_after_vat = sell * (1.0 - (VAT_PCT / 100.0)) if VAT_PCT > 0 else sell
+    # Apply referral fee percentage
+    sell_after_referral = sell_after_vat * (1.0 - (REFERRAL_FEE_PCT / 100.0))
+    # Subtract FBA fee (flat estimate)
+    net_revenue = sell_after_referral - FBA_FEE
+    profit = round(net_revenue - buy, 2)
     roi = round((profit / buy) * 100.0, 2) if buy > 0 else None
     return profit, roi
 
@@ -855,11 +866,25 @@ async def handle_lead_message(message: discord.Message):
 
     buy_inferred = False
     buy_from_keepa = False
+    buy_keepa_source = None
     if buy is None:
-        if keepa_buybox_cur or keepa_amz_cur or keepa_new_cur:
-            buy = keepa_buybox_cur or keepa_amz_cur or keepa_new_cur
+        def neq(a, b):
+            return (a is not None and b is not None and round(a, 2) != round(b, 2)) or (a is not None and b is None)
+        if keepa_amz_cur and neq(keepa_amz_cur, sell):
+            buy = keepa_amz_cur
             buy_from_keepa = True
-            log.info(f"  Using Buy from Keepa current: {buy}")
+            buy_keepa_source = "Amazon"
+            log.info(f"  Using Buy from Keepa Amazon: {buy}")
+        elif keepa_buybox_cur and neq(keepa_buybox_cur, sell):
+            buy = keepa_buybox_cur
+            buy_from_keepa = True
+            buy_keepa_source = "Buy Box"
+            log.info(f"  Using Buy from Keepa Buy Box: {buy}")
+        elif keepa_new_cur and neq(keepa_new_cur, sell):
+            buy = keepa_new_cur
+            buy_from_keepa = True
+            buy_keepa_source = "New"
+            log.info(f"  Using Buy from Keepa New: {buy}")
         elif DEFAULT_BUY > 0:
             buy = DEFAULT_BUY
             log.info(f"  Using DEFAULT_BUY from .env: {buy}")
@@ -938,7 +963,7 @@ async def handle_lead_message(message: discord.Message):
     if buy_inferred:
         footer_parts.append("Buy inferred from ROI")
     if buy_from_keepa:
-        footer_parts.append("Buy from Keepa")
+        footer_parts.append(f"Buy from Keepa ({buy_keepa_source})")
     if sell and keepa_sell and sell == keepa_sell:
         footer_parts.append("Sell from Keepa")
     if buy is not None and roi is not None and DEFAULT_BUY == 0 and "Inferred Buy" in " ":
@@ -1074,6 +1099,10 @@ async def settings_cmd(interaction: discord.Interaction):
         f"- Rainforest: Disabled (Keepa-only)\n"
         f"- Keepa domain input: {KEEPA_DOMAIN_RAW} → trying {KEEPA_DOMAINS_TO_TRY}\n"
         f"- Keepa key set: {'Yes' if bool(KEEPA_KEY) else 'No'}\n"
+        f"*Fees*\n"
+        f"- Referral Fee: {REFERRAL_FEE_PCT:.2f}%\n"
+        f"- FBA Fee: {money(FBA_FEE)}\n"
+        f"- VAT: {VAT_PCT:.2f}%\n"
         f"*Watch*\n"
         f"- Watch-all: {CFG.get('watch_all', False)}\n"
         f"- Watched: {watched if watched else '[]'}",
@@ -1118,8 +1147,23 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
         kp = await keepa_current_prices(session, asin)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
+    def pick_keepa_buy(kp_map, sell_val):
+        if not kp_map:
+            return None
+        amz = kp_map.get("amazon")
+        bb = kp_map.get("buybox")
+        nw = kp_map.get("new")
+        def neq(a, b):
+            return (a is not None and b is not None and round(a, 2) != round(b, 2)) or (a is not None and b is None)
+        if amz and neq(amz, sell_val):
+            return amz
+        if bb and neq(bb, sell_val):
+            return bb
+        if nw and neq(nw, sell_val):
+            return nw
+        return amz or bb or nw
     effective_buy = buy if buy is not None else (
-        (kp.get("buybox") or kp.get("amazon") or kp.get("new")) if kp else (
+        pick_keepa_buy(kp, sell) if kp else (
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
         )
     )
@@ -1155,7 +1199,7 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
         kp = await keepa_current_prices(session, asin)
     effective_buy = buy if buy is not None else (
-        (kp.get("buybox") or kp.get("amazon") or kp.get("new")) if kp else (
+        pick_keepa_buy(kp, sell) if kp else (
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
         )
     )
