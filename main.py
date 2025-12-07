@@ -669,15 +669,27 @@ async def keepa_current_prices(session: aiohttp.ClientSession, asin: str) -> Dic
                         if isinstance(x, (int, float)) and 0 < x <= 500000:
                             return cents(x)
                     return None
-                cand = []
+                bb_cand = []
+                amz_cand = []
+                new_cand = []
                 for off in offers:
                     ocsv = (off or {}).get("offerCSV")
                     p2 = last_offer_price(ocsv)
                     if p2:
-                        cand.append(p2)
-                if cand:
-                    bb = min(cand)
-                    return {"buybox": bb, "new": newp, "amazon": amazp, "domain": domain}
+                        ship = (off or {}).get("shipping")
+                        if isinstance(ship, (int, float)) and ship > 0:
+                            p2 = round(p2 + ship/100.0, 2)
+                        bb_cand.append(p2)
+                        if (off or {}).get("isAmazon"):
+                            amz_cand.append(p2)
+                        cond = (off or {}).get("condition")
+                        if cond == 1 or (isinstance(cond, str) and cond.lower() == "new"):
+                            new_cand.append(p2)
+                bb = min(bb_cand) if bb_cand else buybox
+                amz = min(amz_cand) if amz_cand else amazp
+                nw = min(new_cand) if new_cand else newp
+                if bb or amz or nw:
+                    return {"buybox": bb, "new": nw, "amazon": amz, "domain": domain}
             return {}
         except Exception:
             return {}
@@ -916,6 +928,7 @@ async def handle_lead_message(message: discord.Message):
             buy_from_keepa = True
             buy_keepa_source = "New"
             log.info(f"  Using Buy from Keepa New: {buy}")
+        # Avoid Buy == Sell; prefer a Keepa value that differs
         elif DEFAULT_BUY > 0:
             buy = DEFAULT_BUY
             log.info(f"  Using DEFAULT_BUY from .env: {buy}")
@@ -931,6 +944,10 @@ async def handle_lead_message(message: discord.Message):
         else:
             log.warning(f"  No Buy price found in message AND DEFAULT_BUY is not set - ROI cannot be calculated")
 
+    # Final guard: avoid Buy == Sell (non-informative)
+    if buy is not None and sell is not None and round(buy, 2) == round(sell, 2):
+        log.info("  Suppressing Buy because it equals Sell; set to None")
+        buy = None
     # Calculate profit and ROI from Buy + Sell
     profit, roi_calc = compute_profit_roi(buy, sell)
     if roi is None:
@@ -1186,6 +1203,8 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
         )
     )
+    if effective_buy is not None and sell is not None and round(effective_buy, 2) == round(sell, 2):
+        effective_buy = None
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
@@ -1223,6 +1242,8 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
             DEFAULT_BUY if DEFAULT_BUY > 0 else None
         )
     )
+    if effective_buy is not None and sell is not None and round(effective_buy, 2) == round(sell, 2):
+        effective_buy = None
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
