@@ -856,13 +856,13 @@ async def handle_lead_message(message: discord.Message):
     buy_inferred = False
     buy_from_keepa = False
     if buy is None:
-        if DEFAULT_BUY > 0:
-            buy = DEFAULT_BUY
-            log.info(f"  Using DEFAULT_BUY from .env: {buy}")
-        elif keepa_buybox_cur or keepa_amz_cur or keepa_new_cur:
+        if keepa_buybox_cur or keepa_amz_cur or keepa_new_cur:
             buy = keepa_buybox_cur or keepa_amz_cur or keepa_new_cur
             buy_from_keepa = True
             log.info(f"  Using Buy from Keepa current: {buy}")
+        elif DEFAULT_BUY > 0:
+            buy = DEFAULT_BUY
+            log.info(f"  Using DEFAULT_BUY from .env: {buy}")
         elif roi is not None and sell is not None and sell > 0:
             try:
                 inferred = round(sell / (1.0 + (roi / 100.0)), 2)
@@ -1118,7 +1118,11 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
         kp = await keepa_current_prices(session, asin)
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
-    effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else (kp.get("buybox") or kp.get("amazon") or kp.get("new") if kp else None))
+    effective_buy = buy if buy is not None else (
+        (kp.get("buybox") or kp.get("amazon") or kp.get("new")) if kp else (
+            DEFAULT_BUY if DEFAULT_BUY > 0 else None
+        )
+    )
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
@@ -1150,7 +1154,11 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         if sell is None and kp:
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
         kp = await keepa_current_prices(session, asin)
-    effective_buy = buy if buy is not None else (DEFAULT_BUY if DEFAULT_BUY > 0 else (kp.get("buybox") or kp.get("amazon") or kp.get("new") if kp else None))
+    effective_buy = buy if buy is not None else (
+        (kp.get("buybox") or kp.get("amazon") or kp.get("new")) if kp else (
+            DEFAULT_BUY if DEFAULT_BUY > 0 else None
+        )
+    )
     profit = roi = None
     if effective_buy is not None and sell is not None:
         profit, roi = compute_profit_roi(effective_buy, sell)
