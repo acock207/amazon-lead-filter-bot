@@ -311,17 +311,14 @@ def pick_keepa_buy(kp_map: Optional[Dict[str, Optional[float]]], sell_val: Optio
     if not kp_map:
         return None
     amz = kp_map.get("amazon")
-    bb = kp_map.get("buybox")
     nw = kp_map.get("new")
+    bb = kp_map.get("buybox")
     def diff(a, b):
         return a is not None and (b is None or round(a, 2) != round(b, 2))
-    if diff(amz, sell_val):
-        return amz
-    if diff(nw, sell_val):
-        return nw
-    if diff(bb, sell_val):
-        return bb
-    return amz or nw or bb
+    for v in (amz, nw, bb):
+        if diff(v, sell_val):
+            return v
+    return None
 def profit_breakdown_text(buy: Optional[float], sell: Optional[float]) -> Optional[str]:
     if buy is None or sell is None:
         return None
