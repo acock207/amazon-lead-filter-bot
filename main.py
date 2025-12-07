@@ -307,6 +307,22 @@ def compute_profit_roi(buy: Optional[float], sell: Optional[float]) -> Tuple[Opt
     roi = round((profit / buy) * 100.0, 2) if buy > 0 else None
     return profit, roi
 
+def profit_breakdown_text(buy: Optional[float], sell: Optional[float]) -> Optional[str]:
+    if buy is None or sell is None:
+        return None
+    sell_after_vat = sell * (1.0 - (VAT_PCT / 100.0)) if VAT_PCT > 0 else sell
+    sell_after_referral = sell_after_vat * (1.0 - (REFERRAL_FEE_PCT / 100.0))
+    net_revenue = sell_after_referral - FBA_FEE
+    profit = net_revenue - buy
+    parts = [
+        f"Sell {money(sell)}",
+        f"VAT {VAT_PCT:.0f}% → {money(sell_after_vat)}" if VAT_PCT > 0 else None,
+        f"Referral {REFERRAL_FEE_PCT:.0f}% → {money(sell_after_referral)}" if REFERRAL_FEE_PCT > 0 else None,
+        f"FBA {money(FBA_FEE)} → Net {money(net_revenue)}" if FBA_FEE > 0 else f"Net {money(net_revenue)}",
+        f"Profit {money(profit)}",
+    ]
+    return " | ".join(p for p in parts if p)
+
 # ---------------- Message → Plain text ----------------
 def message_to_plaintext(msg: discord.Message) -> str:
     """
@@ -942,6 +958,10 @@ async def handle_lead_message(message: discord.Message):
         roi_str += "  (Sell price missing)"
     embed.add_field(name="ROI", value=roi_str, inline=False)
 
+    calc_text = profit_breakdown_text(buy, sell)
+    if calc_text:
+        embed.add_field(name="Calc", value=calc_text, inline=False)
+
     keepa_buybox = keepa_buybox_cur
     keepa_new = keepa_new_cur
     keepa_amazon = keepa_amz_cur
@@ -1173,6 +1193,7 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
     kb = money(kp.get("buybox")) if kp else "—"
     kn = money(kp.get("new")) if kp else "—"
     ka = money(kp.get("amazon")) if kp else "—"
+    calc_text = profit_breakdown_text(effective_buy, sell)
     await interaction.followup.send(
         f"ASIN: *{asin}*\n"
         f"Brand: {brand or '—'}\n"
@@ -1180,6 +1201,7 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         f"Sell: {money(sell)} | Buy: {money(effective_buy)}\n"
         f"Keepa Current: Buy Box {kb} | New {kn} | Amazon {ka}\n"
         f"Profit: {money(profit)} | ROI: {pct(roi)}\n"
+        f"Calc: {calc_text or '—'}\n"
         f"Amazon: {amz_url}\n"
         f"Diag: {diag}",
         ephemeral=False
@@ -1210,6 +1232,7 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
     kb = money(kp.get("buybox")) if kp else "—"
     kn = money(kp.get("new")) if kp else "—"
     ka = money(kp.get("amazon")) if kp else "—"
+    calc_text = profit_breakdown_text(effective_buy, sell)
     await interaction.followup.send(
         f"ASIN: *{asin}*\n"
         f"Brand: {brand or '—'}\n"
@@ -1217,6 +1240,7 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         f"Sell: {money(sell)} | Buy used: {money(effective_buy)}\n"
         f"Keepa Current: Buy Box {kb} | New {kn} | Amazon {ka}\n"
         f"Profit: {money(profit)} | ROI: {pct(roi)}\n"
+        f"Calc: {calc_text or '—'}\n"
         f"Amazon: {amz_url}\n"
         f"Diag: {diag}",
         ephemeral=False
