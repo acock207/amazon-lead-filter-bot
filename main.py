@@ -310,6 +310,7 @@ def compute_profit_roi(buy: Optional[float], sell: Optional[float]) -> Tuple[Opt
 def pick_keepa_buy(kp_map: Optional[Dict[str, Optional[float]]], sell_val: Optional[float]) -> Tuple[Optional[float], Optional[str]]:
     if not kp_map:
         return None, None
+    
     # Collect all available Keepa prices
     vals = []
     if kp_map.get("amazon") is not None: vals.append((kp_map["amazon"], "Amazon"))
@@ -319,8 +320,15 @@ def pick_keepa_buy(kp_map: Optional[Dict[str, Optional[float]]], sell_val: Optio
     if not vals:
         return None, None
     
-    # Return the lowest available price to simulate "Best Buy" cost
-    # We ignore sell_val to ensure Buy price is always shown if Keepa has data
+    # First, try to find a price that's different from sell_val (to avoid duplication)
+    if sell_val is not None:
+        different_prices = [(price, source) for price, source in vals if price != sell_val]
+        if different_prices:
+            # Return the lowest price that's different from sell
+            return min(different_prices, key=lambda x: x[0])
+    
+    # If all prices equal sell_val or sell_val is None, return the lowest available price
+    # This ensures we always show a Buy price when Keepa has data
     return min(vals, key=lambda x: x[0])
 def profit_breakdown_text(buy: Optional[float], sell: Optional[float]) -> Optional[str]:
     if buy is None or sell is None:
@@ -933,7 +941,35 @@ async def handle_lead_message(message: discord.Message):
         else:
             log.warning(f"  No Buy price found in message AND DEFAULT_BUY is not set - ROI cannot be calculated")
 
-    # Final guard: avoid Buy == Sell (non-informative)
+    # Final guard: avoid Buy == Sell (non-informative) - only when we have DEFAULT_BUY as fallback
+    if buy is not None and sell is not None and buy == sell and buy_from_keepa and DEFAULT_BUY > 0:
+        # If Buy equals Sell and both came from Keepa, prefer a different Keepa price if available
+        alt_buy, alt_source = None, None
+        
+        # Get all available Keepa prices that are different from sell
+        available_alternatives = []
+        if kp:
+            if kp.get("amazon") is not None and kp["amazon"] != sell:
+                available_alternatives.append((kp["amazon"], "Amazon"))
+            if kp.get("new") is not None and kp["new"] != sell:
+                available_alternatives.append((kp["new"], "New"))
+            if kp.get("buybox") is not None and kp["buybox"] != sell:
+                available_alternatives.append((kp["buybox"], "Buy Box"))
+        
+        # If we have alternatives, pick the lowest one (best buy)
+        if available_alternatives:
+            alt_buy, alt_source = min(available_alternatives, key=lambda x: x[0])
+            buy = alt_buy
+            buy_keepa_source = alt_source
+            log.info(f"  Switched Buy from Keepa ({alt_source}) to avoid duplication: {buy}")
+        else:
+            # No alternative available - use DEFAULT_BUY as fallback
+            buy = DEFAULT_BUY
+            buy_from_keepa = False
+            buy_keepa_source = None
+            log.info(f"  Using DEFAULT_BUY to avoid duplication: {buy}")
+    # Note: If no DEFAULT_BUY is set, we keep the Keepa price even if it equals Sell
+    # This ensures Buy price is always visible when Keepa has data
     
     # Calculate profit and ROI from Buy + Sell
     profit, roi_calc = compute_profit_roi(buy, sell)
