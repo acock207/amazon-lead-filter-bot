@@ -50,8 +50,6 @@ MIN_PROFIT = float(os.getenv("MIN_PROFIT", "5"))
 MIN_ROI = float(os.getenv("MIN_ROI", "8"))
 ALLOW_UNKNOWN_ELIG = os.getenv("ALLOW_UNKNOWN_ELIG", "false").lower() in {"1","true","yes","on"}
 
-DEFAULT_BUY = float(os.getenv("DEFAULT_BUY", "0"))
-
 KEEPA_KEY = os.getenv("KEEPA_KEY")
 KEEPA_DOMAIN_RAW = (os.getenv("KEEPA_DOMAIN") or "GB").strip()
 
@@ -926,9 +924,6 @@ async def handle_lead_message(message: discord.Message):
             buy_from_keepa = True
             buy_keepa_source = k_source
             log.info(f"  Using Buy from Keepa ({k_source}): {buy}")
-        elif DEFAULT_BUY > 0:
-            buy = DEFAULT_BUY
-            log.info(f"  Using DEFAULT_BUY from .env: {buy}")
         elif roi is not None and sell is not None and sell > 0:
             try:
                 inferred = round(sell / (1.0 + (roi / 100.0)), 2)
@@ -939,7 +934,7 @@ async def handle_lead_message(message: discord.Message):
             except Exception:
                 pass
         else:
-            log.warning(f"  No Buy price found in message AND DEFAULT_BUY is not set - ROI cannot be calculated")
+            log.warning(f"  No Buy price found in message - ROI cannot be calculated")
 
     # Final guard: avoid Buy == Sell (non-informative) - always check for alternatives
     if buy is not None and sell is not None and buy == sell and buy_from_keepa:
@@ -962,13 +957,7 @@ async def handle_lead_message(message: discord.Message):
             buy = alt_buy
             buy_keepa_source = alt_source
             log.info(f"  Switched Buy from Keepa ({alt_source}) to avoid duplication: {buy}")
-        elif DEFAULT_BUY > 0:
-            # No alternative available - use DEFAULT_BUY as fallback if available
-            buy = DEFAULT_BUY
-            buy_from_keepa = False
-            buy_keepa_source = None
-            log.info(f"  Using DEFAULT_BUY to avoid duplication: {buy}")
-        # If no alternatives AND no DEFAULT_BUY, keep the Keepa price (ensures visibility)
+        # If no alternatives, keep the Keepa price (ensures visibility)
     
     # Calculate profit and ROI from Buy + Sell
     profit, roi_calc = compute_profit_roi(buy, sell)
@@ -1032,16 +1021,12 @@ async def handle_lead_message(message: discord.Message):
     footer_parts = []
     if keepa_diag:
         footer_parts.append(f"Keepa: {keepa_diag}")
-    if buy and DEFAULT_BUY > 0 and buy == DEFAULT_BUY:
-        footer_parts.append("Buy from DEFAULT_BUY")
     if buy_inferred:
         footer_parts.append("Buy inferred from ROI")
     if buy_from_keepa:
         footer_parts.append(f"Buy from Keepa ({buy_keepa_source})")
     if sell and keepa_sell and sell == keepa_sell:
         footer_parts.append("Sell from Keepa")
-    if buy is not None and roi is not None and DEFAULT_BUY == 0 and "Inferred Buy" in " ":
-        pass
     if footer_parts:
         embed.set_footer(text=" • ".join(footer_parts))
 
@@ -1168,7 +1153,6 @@ async def settings_cmd(interaction: discord.Interaction):
         f"- Eligibility required: {'Yes' if not ALLOW_UNKNOWN_ELIG else 'No (unknown allowed)'}\n"
         f"- Min Profit: {money(MIN_PROFIT)}\n"
         f"- Min ROI: {MIN_ROI:.2f}%\n"
-        f"- Default Buy: {money(DEFAULT_BUY) if DEFAULT_BUY else '—'}\n"
         f"*Data Sources*\n"
         f"- Rainforest: Disabled (Keepa-only)\n"
         f"- Keepa domain input: {KEEPA_DOMAIN_RAW} → trying {KEEPA_DOMAINS_TO_TRY}\n"
@@ -1195,11 +1179,6 @@ async def set_min_roi_cmd(interaction: discord.Interaction, value: float):
     MIN_ROI = float(value)
     await interaction.response.send_message(f"Min ROI set to {MIN_ROI:.2f}%", ephemeral=False)
 
-@bot.tree.command(name="set_default_buy", description="Set default buy price for ASIN-only leads")
-async def set_default_buy_cmd(interaction: discord.Interaction, value: float):
-    global DEFAULT_BUY
-    DEFAULT_BUY = float(value)
-    await interaction.response.send_message(f"Default buy set to {money(DEFAULT_BUY)}", ephemeral=False)
 
 @bot.tree.command(name="set_allow_unknown_elig", description="Allow or block unknown eligibility")
 async def set_allow_unknown_elig_cmd(interaction: discord.Interaction, allow: bool):
@@ -1225,8 +1204,6 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
     if effective_buy is None and kp:
         k_val, _ = pick_keepa_buy(kp, sell)
         effective_buy = k_val
-    if effective_buy is None and DEFAULT_BUY > 0:
-        effective_buy = DEFAULT_BUY
     
     profit = roi = None
     if effective_buy is not None and sell is not None:
@@ -1248,8 +1225,8 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
         ephemeral=False
     )
 
-@bot.tree.command(name="calc_asin", description="Fetch Keepa price and compute ROI/Profit (uses default buy unless provided)")
-@app_commands.describe(asin="10-char ASIN", buy="Override buy price (defaults to DEFAULT_BUY)")
+@bot.tree.command(name="calc_asin", description="Fetch Keepa price and compute ROI/Profit")
+@app_commands.describe(asin="10-char ASIN", buy="Override buy price (optional)")
 async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[float] = None):
     asin = asin.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{10}", asin):
@@ -1265,8 +1242,6 @@ async def calc_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
     if effective_buy is None and kp:
         k_val, _ = pick_keepa_buy(kp, sell)
         effective_buy = k_val
-    if effective_buy is None and DEFAULT_BUY > 0:
-        effective_buy = DEFAULT_BUY
 
 def parse_message_url(url: str) -> Optional[Tuple[int, int]]:
     try:
