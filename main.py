@@ -933,6 +933,10 @@ async def handle_lead_message(message: discord.Message):
             buy = keepa_amz_cur
             buy_from_keepa = True
             buy_keepa_source = "Amazon"
+        elif keepa_buybox_cur is not None:
+            buy = keepa_buybox_cur
+            buy_from_keepa = True
+            buy_keepa_source = "Buy Box"
         else:
             buy = None
         log.info(f"  Keepa-only mode: Buy {buy}")
@@ -1236,7 +1240,7 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
     # Determine effective buy price
     effective_buy = buy
     if KEEPA_ONLY_PRICES and kp:
-        effective_buy = kp.get("new") or kp.get("amazon")
+        effective_buy = kp.get("new") or kp.get("amazon") or kp.get("buybox")
     elif effective_buy is None and kp:
         k_val, _ = pick_keepa_buy(kp, sell)
         effective_buy = k_val
@@ -1316,7 +1320,7 @@ async def diag_msg(interaction: discord.Interaction, link: str):
         kp = await keepa_current_prices(session, asin)
     if KEEPA_ONLY_PRICES and kp:
         sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
-        buy = kp.get("new") or kp.get("amazon")
+        buy = kp.get("new") or kp.get("amazon") or kp.get("buybox")
     else:
         if sell is None:
             sell = (keepa_sell or (kp.get("buybox") or kp.get("amazon") or kp.get("new") if kp else None))
