@@ -61,6 +61,7 @@ RAINFOREST_CONDITION_NEW_ONLY = os.getenv("RAINFOREST_CONDITION_NEW_ONLY", "fals
 RAINFOREST_SHOW_DIFFERENT_ASINS = os.getenv("RAINFOREST_SHOW_DIFFERENT_ASINS", "false").lower() in {"1","true","yes","on"}
 RAINFOREST_MIN_PRICE = os.getenv("RAINFOREST_MIN_PRICE")
 RAINFOREST_MAX_PRICE = os.getenv("RAINFOREST_MAX_PRICE")
+KEEPA_ONLY_PRICES = os.getenv("KEEPA_ONLY", "false").lower() in {"1","true","yes","on"}
 
 # Profit/ROI fee assumptions (can be adjusted via environment)
 REFERRAL_FEE_PCT = float(os.getenv("REFERRAL_FEE_PCT", "15"))
@@ -902,51 +903,66 @@ async def handle_lead_message(message: discord.Message):
         keepa_new_cur = kp.get("new") if kp else None
         keepa_amz_cur = kp.get("amazon") if kp else None
     
-    # Use Keepa sell price if we don't have one from message
-    if sell is None or sell <= 0:
-        fallback_cur = keepa_buybox_cur or keepa_amz_cur or keepa_new_cur
-        if keepa_sell:
-            sell = keepa_sell
-            log.info(f"  Using Sell price from Keepa: {sell}")
-        elif fallback_cur:
-            sell = fallback_cur
-            log.info(f"  Using Sell price from Keepa current: {sell}")
-        else:
-            log.warning(f"  No Sell price found in message OR Keepa")
+    if KEEPA_ONLY_PRICES:
+        sell = keepa_buybox_cur or keepa_amz_cur or keepa_new_cur
+        log.info(f"  Keepa-only mode: Sell {sell}")
     else:
-        log.info(f"  Using Sell price from message: {sell} (Keepa had: {keepa_sell})")
+        if sell is None or sell <= 0:
+            fallback_cur = keepa_buybox_cur or keepa_amz_cur or keepa_new_cur
+            if keepa_sell:
+                sell = keepa_sell
+                log.info(f"  Using Sell price from Keepa: {sell}")
+            elif fallback_cur:
+                sell = fallback_cur
+                log.info(f"  Using Sell price from Keepa current: {sell}")
+            else:
+                log.warning(f"  No Sell price found in message OR Keepa")
+        else:
+            log.info(f"  Using Sell price from message: {sell} (Keepa had: {keepa_sell})")
 
     buy_inferred = False
     buy_from_keepa = False
     buy_default_used = False
     buy_keepa_source = None
-    if buy is None:
-        # Try to get buy price from Keepa (lowest available)
-        k_buy, k_source = pick_keepa_buy(kp, sell)
-        if k_buy is not None:
-            buy = k_buy
+    if KEEPA_ONLY_PRICES:
+        if keepa_new_cur is not None:
+            buy = keepa_new_cur
             buy_from_keepa = True
-            buy_keepa_source = k_source
-            log.info(f"  Using Buy from Keepa ({k_source}): {buy}")
-        elif roi is not None and sell is not None and sell > 0:
-            try:
-                inferred = round(sell / (1.0 + (roi / 100.0)), 2)
-                if inferred > 0:
-                    buy = inferred
-                    buy_inferred = True
-                    log.info(f"  Inferred Buy from ROI: {buy}")
-            except Exception:
-                pass
+            buy_keepa_source = "New"
+        elif keepa_amz_cur is not None:
+            buy = keepa_amz_cur
+            buy_from_keepa = True
+            buy_keepa_source = "Amazon"
+        else:
+            buy = None
+        log.info(f"  Keepa-only mode: Buy {buy}")
+    else:
         if buy is None:
-            if DEFAULT_BUY > 0:
-                buy = DEFAULT_BUY
-                buy_default_used = True
-                log.info(f"  Using default Buy price: {buy}")
-            else:
-                log.warning(f"  No Buy price found in message - ROI cannot be calculated")
+            k_buy, k_source = pick_keepa_buy(kp, sell)
+            if k_buy is not None:
+                buy = k_buy
+                buy_from_keepa = True
+                buy_keepa_source = k_source
+                log.info(f"  Using Buy from Keepa ({k_source}): {buy}")
+            elif roi is not None and sell is not None and sell > 0:
+                try:
+                    inferred = round(sell / (1.0 + (roi / 100.0)), 2)
+                    if inferred > 0:
+                        buy = inferred
+                        buy_inferred = True
+                        log.info(f"  Inferred Buy from ROI: {buy}")
+                except Exception:
+                    pass
+            if buy is None:
+                if DEFAULT_BUY > 0:
+                    buy = DEFAULT_BUY
+                    buy_default_used = True
+                    log.info(f"  Using default Buy price: {buy}")
+                else:
+                    log.warning(f"  No Buy price found in message - ROI cannot be calculated")
 
     # Final guard: avoid Buy == Sell (non-informative) - always check for alternatives
-    if buy is not None and sell is not None and buy == sell and buy_from_keepa:
+    if (not KEEPA_ONLY_PRICES) and buy is not None and sell is not None and buy == sell and buy_from_keepa:
         # If Buy equals Sell and both came from Keepa, prefer a different Keepa price if available
         alt_buy, alt_source = None, None
         
@@ -1036,6 +1052,8 @@ async def handle_lead_message(message: discord.Message):
         footer_parts.append(f"Buy from Keepa ({buy_keepa_source})")
     if buy_default_used:
         footer_parts.append("Buy default")
+    if KEEPA_ONLY_PRICES:
+        footer_parts.append("Keepa-only prices")
     if sell and keepa_sell and sell == keepa_sell:
         footer_parts.append("Sell from Keepa")
     if footer_parts:
@@ -1168,6 +1186,7 @@ async def settings_cmd(interaction: discord.Interaction):
         f"- Rainforest: Disabled (Keepa-only)\n"
         f"- Keepa domain input: {KEEPA_DOMAIN_RAW} → trying {KEEPA_DOMAINS_TO_TRY}\n"
         f"- Keepa key set: {'Yes' if bool(KEEPA_KEY) else 'No'}\n"
+        f"- Keepa-only prices: {'Yes' if KEEPA_ONLY_PRICES else 'No'}\n"
         f"*Fees*\n"
         f"- Referral Fee: {REFERRAL_FEE_PCT:.2f}%\n"
         f"- FBA Fee: {money(FBA_FEE)}\n"
@@ -1209,12 +1228,16 @@ async def diag_asin(interaction: discord.Interaction, asin: str, buy: Optional[f
     async with aiohttp.ClientSession() as session:
         sell, brand, title, diag, used = await product_fetch(session, asin)
         kp = await keepa_current_prices(session, asin)
-        if sell is None and kp:
+        if KEEPA_ONLY_PRICES and kp:
+            sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
+        elif sell is None and kp:
             sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
     amz_url = amazon_url_for_domain(asin, used if used is not None else KEEPA_DOMAINS_TO_TRY[0])
     # Determine effective buy price
     effective_buy = buy
-    if effective_buy is None and kp:
+    if KEEPA_ONLY_PRICES and kp:
+        effective_buy = kp.get("new") or kp.get("amazon")
+    elif effective_buy is None and kp:
         k_val, _ = pick_keepa_buy(kp, sell)
         effective_buy = k_val
     
@@ -1291,11 +1314,15 @@ async def diag_msg(interaction: discord.Interaction, link: str):
         if brand: keepa_brand = brand
         if title: keepa_title = title
         kp = await keepa_current_prices(session, asin)
-    if sell is None:
-        sell = (keepa_sell or (kp.get("buybox") or kp.get("amazon") or kp.get("new") if kp else None))
-    if buy is None and kp:
-        k_val, _ = pick_keepa_buy(kp, sell)
-        buy = k_val
+    if KEEPA_ONLY_PRICES and kp:
+        sell = kp.get("buybox") or kp.get("amazon") or kp.get("new")
+        buy = kp.get("new") or kp.get("amazon")
+    else:
+        if sell is None:
+            sell = (keepa_sell or (kp.get("buybox") or kp.get("amazon") or kp.get("new") if kp else None))
+        if buy is None and kp:
+            k_val, _ = pick_keepa_buy(kp, sell)
+            buy = k_val
     profit, roi_calc = compute_profit_roi(buy, sell)
     if roi is None: roi = roi_calc
     amz_url = amazon_url_for_domain(asin, domain_used if domain_used is not None else KEEPA_DOMAINS_TO_TRY[0])
