@@ -66,6 +66,7 @@ RAINFOREST_MAX_PRICE = os.getenv("RAINFOREST_MAX_PRICE")
 REFERRAL_FEE_PCT = float(os.getenv("REFERRAL_FEE_PCT", "15"))
 FBA_FEE = float(os.getenv("FBA_FEE", "0"))
 VAT_PCT = float(os.getenv("VAT_PCT", "0"))
+DEFAULT_BUY = float(os.getenv("DEFAULT_BUY", "10"))
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -324,6 +325,8 @@ def pick_keepa_buy(kp_map: Optional[Dict[str, Optional[float]]], sell_val: Optio
         if different_prices:
             # Return the lowest price that's different from sell
             return min(different_prices, key=lambda x: x[0])
+        # If all available Keepa prices equal the sell price, do not return a duplicate
+        return None, None
     
     # If all prices equal sell_val or sell_val is None, return the lowest available price
     # This ensures we always show a Buy price when Keepa has data
@@ -915,6 +918,7 @@ async def handle_lead_message(message: discord.Message):
 
     buy_inferred = False
     buy_from_keepa = False
+    buy_default_used = False
     buy_keepa_source = None
     if buy is None:
         # Try to get buy price from Keepa (lowest available)
@@ -933,8 +937,13 @@ async def handle_lead_message(message: discord.Message):
                     log.info(f"  Inferred Buy from ROI: {buy}")
             except Exception:
                 pass
-        else:
-            log.warning(f"  No Buy price found in message - ROI cannot be calculated")
+        if buy is None:
+            if DEFAULT_BUY > 0:
+                buy = DEFAULT_BUY
+                buy_default_used = True
+                log.info(f"  Using default Buy price: {buy}")
+            else:
+                log.warning(f"  No Buy price found in message - ROI cannot be calculated")
 
     # Final guard: avoid Buy == Sell (non-informative) - always check for alternatives
     if buy is not None and sell is not None and buy == sell and buy_from_keepa:
@@ -1025,6 +1034,8 @@ async def handle_lead_message(message: discord.Message):
         footer_parts.append("Buy inferred from ROI")
     if buy_from_keepa:
         footer_parts.append(f"Buy from Keepa ({buy_keepa_source})")
+    if buy_default_used:
+        footer_parts.append("Buy default")
     if sell and keepa_sell and sell == keepa_sell:
         footer_parts.append("Sell from Keepa")
     if footer_parts:
@@ -1161,6 +1172,8 @@ async def settings_cmd(interaction: discord.Interaction):
         f"- Referral Fee: {REFERRAL_FEE_PCT:.2f}%\n"
         f"- FBA Fee: {money(FBA_FEE)}\n"
         f"- VAT: {VAT_PCT:.2f}%\n"
+        f"*Defaults*\n"
+        f"- Default Buy: {money(DEFAULT_BUY)}\n"
         f"*Watch*\n"
         f"- Watch-all: {CFG.get('watch_all', False)}\n"
         f"- Watched: {watched if watched else '[]'}",
